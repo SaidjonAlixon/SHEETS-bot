@@ -11,8 +11,9 @@ factoring_menu = ReplyKeyboardMarkup(
             KeyboardButton(text="📊 Hisobot olish"),
         ],
         [
-            KeyboardButton(text="⬅️ Orqaga")
-        ]
+            KeyboardButton(text="⬅️ Orqaga"),
+            KeyboardButton(text="❌ Bekor qilish"),
+        ],
     ],
     resize_keyboard=True
 )

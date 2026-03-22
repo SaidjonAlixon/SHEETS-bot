@@ -7,8 +7,9 @@ broker_menu = ReplyKeyboardMarkup(
             KeyboardButton(text="📋 Oxirgi to'lovlar"),
         ],
         [
-            KeyboardButton(text="⬅️ Orqaga")
-        ]
+            KeyboardButton(text="⬅️ Orqaga"),
+            KeyboardButton(text="❌ Bekor qilish"),
+        ],
     ],
     resize_keyboard=True
 )
@@ -16,8 +17,9 @@ broker_menu = ReplyKeyboardMarkup(
 expenses_menu = ReplyKeyboardMarkup(
     keyboard=[
         [
-            KeyboardButton(text="⬅️ Back (Main Menu)")
-        ]
+            KeyboardButton(text="⬅️ Back (Main Menu)"),
+            KeyboardButton(text="❌ Bekor qilish"),
+        ],
     ],
     resize_keyboard=True
 )

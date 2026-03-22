@@ -14,8 +14,9 @@ statement_menu = ReplyKeyboardMarkup(
             KeyboardButton(text="📈 Solishtirish natijalari"),
         ],
         [
-            KeyboardButton(text="⬅️ Back (Main Menu)")
-        ]
+            KeyboardButton(text="⬅️ Back (Main Menu)"),
+            KeyboardButton(text="❌ Bekor qilish"),
+        ],
     ],
     resize_keyboard=True
 )
