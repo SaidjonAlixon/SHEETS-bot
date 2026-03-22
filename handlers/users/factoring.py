@@ -3,7 +3,7 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 from aiogram.fsm.context import FSMContext
 from loader import dp, bot
 from keyboards.default.factoring_menu import factoring_menu
-from keyboards.default.main_menu import get_main_menu, load_select_menu
+from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from services.excel_parser import ExcelParser
 from services.google_sheets import get_sheet_service
 from states.bot_states import BotStates
@@ -17,7 +17,7 @@ import re
 async def enter_factoring(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Factoring)
     await message.answer("Factoring Payments bo'limiga xush kelibsiz.\n"
@@ -45,7 +45,7 @@ async def go_back_from_search(message: types.Message, state: FSMContext):
 async def factoring_recent_loads(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     try:
         sheet_service = get_sheet_service()
@@ -122,7 +122,7 @@ async def factoring_search_ask(message: types.Message, state: FSMContext):
 async def factoring_search_run(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     load_num = message.text.strip()
     if not load_num:
@@ -160,7 +160,7 @@ async def factoring_search_run(message: types.Message, state: FSMContext):
 async def factoring_report_ask(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     try:
         sheet_service = get_sheet_service()
@@ -229,7 +229,7 @@ async def ask_file(message: types.Message):
 async def handle_factoring_document(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     document = message.document
     file_id = document.file_id
@@ -402,7 +402,7 @@ async def handle_factoring_date_range(message: types.Message, state: FSMContext)
     file_name = data.get('factoring_filename', 'report.xlsx')
     company = data.get("selected_company") or get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
 
     if not parsed_data:

@@ -3,7 +3,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from loader import dp, bot
 from keyboards.default.sub_menus import broker_menu
-from keyboards.default.main_menu import get_main_menu, load_select_menu
+from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from gspread.exceptions import APIError as GspreadAPIError
 from services.google_sheets import get_sheet_service
 from services.excel_parser import ExcelParser
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 async def enter_broker(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Broker)
     await message.answer("Broker Payments bo'limi.\nFayl yuklang yoki buyruq tanlang:", reply_markup=broker_menu)
@@ -42,7 +42,7 @@ async def ask_broker_file(message: types.Message):
 async def broker_recent_payments(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     try:
         sheet_service = get_sheet_service()
@@ -115,7 +115,7 @@ async def callback_broker_recent(callback: types.CallbackQuery):
 async def handle_broker_document(message: types.Message):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
 
     document = message.document

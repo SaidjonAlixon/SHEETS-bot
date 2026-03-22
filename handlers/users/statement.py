@@ -2,7 +2,7 @@ from aiogram import types, F
 from aiogram.fsm.context import FSMContext
 from loader import dp, bot
 from keyboards.default.statement_menu import statement_menu
-from keyboards.default.main_menu import get_main_menu, load_select_menu
+from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from services.excel_parser import ExcelParser
 from services.google_sheets import get_sheet_service
 from states.bot_states import BotStates
@@ -19,7 +19,7 @@ async def enter_statement(message: types.Message, state: FSMContext):
         return
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Statement)
     await message.answer("Statement Check bo'limi.\n"
@@ -38,7 +38,7 @@ async def ask_statement_file(message: types.Message):
 async def handle_statement_doc(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
 
     document = message.document

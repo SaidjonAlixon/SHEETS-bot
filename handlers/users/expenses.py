@@ -3,7 +3,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from loader import dp, bot
 from keyboards.default.sub_menus import expenses_menu
-from keyboards.default.main_menu import get_main_menu, load_select_menu
+from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from states.bot_states import BotStates
 from utils.company_storage import get_company
 
@@ -11,7 +11,7 @@ from utils.company_storage import get_company
 async def enter_fuel(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Fuel)
     await message.answer("Iltimos, Excel (xlsx, xls) fayl yuboring.", reply_markup=expenses_menu)
@@ -20,7 +20,7 @@ async def enter_fuel(message: types.Message, state: FSMContext):
 async def enter_toll(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Toll)
     await message.answer("Toll Expenses bo'limi.\n"
@@ -43,7 +43,7 @@ async def handle_toll_doc(message: types.Message, state: FSMContext):
 async def handle_expense_doc(message: types.Message, expense_type: str, state: FSMContext):
     company = get_company(message.from_user.id)
     if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=load_select_menu)
+        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     document = message.document
     file_id = document.file_id
