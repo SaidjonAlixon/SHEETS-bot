@@ -131,16 +131,35 @@ class Database:
             print(f"Error getting logs: {e}")
             return []
 
-    def get_users_with_activity(self):
-        """Aktivlik qilgan foydalanuvchilar (buxgalters va adminlar)."""
+    def get_users_with_activity(self, env_admin_ids=None):
+        """Faqat hozir dostupi bor foydalanuvchilar (allowed_users, admins, .env ADMINS)."""
         if not self.connection: return []
         try:
-            self.cursor.execute("""
-                SELECT DISTINCT ON (user_id) user_id, full_name, username
-                FROM activity_logs
-                WHERE user_id IS NOT NULL
-                ORDER BY user_id, timestamp DESC
-            """)
+            env_ids = [int(x) for x in (env_admin_ids or []) if str(x).strip().isdigit()]
+            if env_ids:
+                placeholders = ",".join(["%s"] * len(env_ids))
+                self.cursor.execute(f"""
+                    SELECT DISTINCT ON (a.user_id) a.user_id, a.full_name, a.username
+                    FROM activity_logs a
+                    WHERE a.user_id IS NOT NULL
+                      AND (
+                        a.user_id IN (SELECT user_id FROM allowed_users)
+                        OR a.user_id IN (SELECT user_id FROM admins)
+                        OR a.user_id IN ({placeholders})
+                      )
+                    ORDER BY a.user_id, a.timestamp DESC
+                """, env_ids)
+            else:
+                self.cursor.execute("""
+                    SELECT DISTINCT ON (a.user_id) a.user_id, a.full_name, a.username
+                    FROM activity_logs a
+                    WHERE a.user_id IS NOT NULL
+                      AND (
+                        a.user_id IN (SELECT user_id FROM allowed_users)
+                        OR a.user_id IN (SELECT user_id FROM admins)
+                      )
+                    ORDER BY a.user_id, a.timestamp DESC
+                """)
             return self.cursor.fetchall()
         except Exception as e:
             print(f"Error get_users_with_activity: {e}")

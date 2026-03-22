@@ -213,7 +213,7 @@ async def admin_callback(callback: types.CallbackQuery, state: FSMContext):
     elif action == "logs":
         await state.clear()
         db = get_db()
-        users = db.get_users_with_activity() if db and db.connection else []
+        users = db.get_users_with_activity(config.ADMINS) if db and db.connection else []
         if not users:
             await callback.message.edit_text(
                 "📜 Aktivlik loglari bo'sh. Hali hech kim botdan foydalanmagan.",
