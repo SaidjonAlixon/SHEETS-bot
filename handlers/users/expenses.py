@@ -632,14 +632,6 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
 
         if assigned:
             matched_items += 1
-        elif segments:
-            # Header/sana mosligi topilmasa ham yozuvni yo'qotmaslik uchun first segmentga yuboramiz
-            i = 0
-            if card not in card_totals_by_seg[i]:
-                card_totals_by_seg[i][card] = [0.0, 0.0]
-            card_totals_by_seg[i][card][0] += fuel_sum
-            card_totals_by_seg[i][card][1] += discount_sum
-            matched_items += 1
 
     total_updated = 0
     total_skipped = 0
@@ -1030,14 +1022,6 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
                 transponder_totals_by_seg[i][transponder] += toll_sum
                 matched += 1
                 break
-        else:
-            # Sana segmentiga tushmasa ham birinchi segmentga yozib yuboramiz
-            if segments:
-                i = 0
-                if transponder not in transponder_totals_by_seg[i]:
-                    transponder_totals_by_seg[i][transponder] = 0.0
-                transponder_totals_by_seg[i][transponder] += toll_sum
-                matched += 1
 
     if matched == 0:
         await callback.message.edit_text("❌ Mos hafta topilmadi. Faylni tekshiring.")
