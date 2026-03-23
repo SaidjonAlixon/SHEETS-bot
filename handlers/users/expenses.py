@@ -521,7 +521,8 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         unique[key] = True
     date_matches = sorted(list(unique.keys()), key=lambda x: x[2])
 
-    # Fuel/Discount ustun topish (Disc Amt -> Discount, Toll Exp emas)
+    # Card/Fuel/Discount ustun topish (Disc Amt -> Discount, Toll Exp emas)
+    card_cols = []
     fuel_cols = []
     discount_cols = []
     # Taxmin: Fuel/Discount header row 1-6 atrofida
@@ -536,6 +537,10 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
             if "fuel" in cell_s and ("exp" in cell_s or "after" in cell_s):
                 fuel_cols.append(c + 1)
 
+            # "EFS Card" ustuni (Owner Operators: C, Company Drivers: D)
+            if "efs" in cell_s and "card" in cell_s:
+                card_cols.append(c + 1)
+
             # "Discount", "Disc Amt" - Disc Amt (Q) shu ustunga yoziladi
             # "Fuel after discount" ni hisobga olmaslik: fuel bo'lmagan discount
             if "fuel" not in cell_s and ("discount" in cell_s or "disc" in cell_s):
@@ -546,6 +551,9 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         fuel_cols = [5]
     if not discount_cols:
         discount_cols = [6]
+    if not card_cols:
+        # Eski layout fallback: C ustun
+        card_cols = [3]
 
     # Har bir sana oralig'i uchun fuel/discount colni segmentga moslab tanlaymiz.
     # Segment: date_matches[i].start_col -> date_matches[i+1].start_col-1
@@ -557,14 +565,18 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
             # segment ichida joylashgan fuel/discount header col'larini tanlaymiz
             f_col = next((fc for fc in fuel_cols if start_col <= fc <= end_col), None)
             d_col = next((dc for dc in discount_cols if start_col <= dc <= end_col), None)
+            c_col = next((cc for cc in card_cols if start_col <= cc <= end_col), None)
             if f_col is None:
                 f_col = fuel_cols[0]
             if d_col is None:
                 d_col = discount_cols[0]
+            if c_col is None:
+                c_col = card_cols[0]
             segments.append({
                 "label": f"{start_date.strftime('%m.%d')}-{end_date.strftime('%m.%d')}",
                 "start_date": start_date,
                 "end_date": end_date,
+                "card_col": c_col,
                 "fuel_col": f_col,
                 "discount_col": d_col,
             })
@@ -574,6 +586,7 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
             "label": sheet_name,
             "start_date": date(year, 1, 1),
             "end_date": date(year, 12, 31),
+            "card_col": card_cols[0],
             "fuel_col": fuel_cols[0],
             "discount_col": discount_cols[0],
         }]
@@ -619,6 +632,14 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
 
         if assigned:
             matched_items += 1
+        elif segments:
+            # Header/sana mosligi topilmasa ham yozuvni yo'qotmaslik uchun first segmentga yuboramiz
+            i = 0
+            if card not in card_totals_by_seg[i]:
+                card_totals_by_seg[i][card] = [0.0, 0.0]
+            card_totals_by_seg[i][card][0] += fuel_sum
+            card_totals_by_seg[i][card][1] += discount_sum
+            matched_items += 1
 
     total_updated = 0
     total_skipped = 0
@@ -635,6 +656,7 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
             card_totals_tuple,
             fuel_col=seg["fuel_col"],
             discount_col=seg["discount_col"],
+            card_col=seg.get("card_col", 3),
             company=company,
         )
         total_updated += updated
@@ -940,6 +962,7 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
         unique[(s_date, e_date, c)] = True
     date_matches = sorted(list(unique.keys()), key=lambda x: x[2])
 
+    transponder_cols = []
     toll_cols = []
     for r in range(min(6, len(top_grid))):
         row_data = top_grid[r] if r < len(top_grid) else []
@@ -948,11 +971,16 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
             if cell is None:
                 continue
             cell_s = str(cell).lower()
+            if "transponder" in cell_s:
+                transponder_cols.append(c + 1)
             if "toll" in cell_s and ("exp" in cell_s or "expenses" in cell_s):
                 toll_cols.append(c + 1)
 
     if not toll_cols:
         toll_cols = [7]
+    if not transponder_cols:
+        # Eski layout fallback: D ustun
+        transponder_cols = [4]
 
     segments = []
     if date_matches:
@@ -960,10 +988,12 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
             start_date, end_date, start_col = date_matches[i]
             end_col = (date_matches[i + 1][2] - 1) if i + 1 < len(date_matches) else 26
             t_col = next((tc for tc in toll_cols if start_col <= tc <= end_col), toll_cols[0])
+            tr_col = next((tc for tc in transponder_cols if start_col <= tc <= end_col), transponder_cols[0])
             segments.append({
                 "label": f"{start_date.strftime('%m.%d')}-{end_date.strftime('%m.%d')}",
                 "start_date": start_date,
                 "end_date": end_date,
+                "transponder_col": tr_col,
                 "toll_col": t_col,
             })
     else:
@@ -971,6 +1001,7 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
             "label": sheet_name,
             "start_date": date(year, 1, 1),
             "end_date": date(year, 12, 31),
+            "transponder_col": transponder_cols[0],
             "toll_col": toll_cols[0],
         }]
 
@@ -999,6 +1030,14 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
                 transponder_totals_by_seg[i][transponder] += toll_sum
                 matched += 1
                 break
+        else:
+            # Sana segmentiga tushmasa ham birinchi segmentga yozib yuboramiz
+            if segments:
+                i = 0
+                if transponder not in transponder_totals_by_seg[i]:
+                    transponder_totals_by_seg[i][transponder] = 0.0
+                transponder_totals_by_seg[i][transponder] += toll_sum
+                matched += 1
 
     if matched == 0:
         await callback.message.edit_text("❌ Mos hafta topilmadi. Faylni tekshiring.")
@@ -1015,7 +1054,7 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
             sheet_name,
             totals,
             toll_col=seg["toll_col"],
-            transponder_col=4,
+            transponder_col=seg.get("transponder_col", 4),
             company=company,
         )
         total_updated += updated
