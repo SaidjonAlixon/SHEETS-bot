@@ -299,6 +299,7 @@ class GoogleSheetService:
 
         results = []
         cells_by_sheet = {}
+        pending_by_sheet = {}
         updated = 0
         skipped = 0
         not_found = 0
@@ -365,6 +366,7 @@ class GoogleSheetService:
 
         results = []
         cells_by_sheet = {}
+        pending_by_sheet = {}
         updated = 0
         skipped = 0
         not_found = 0
@@ -387,10 +389,13 @@ class GoogleSheetService:
             if self._is_empty_or_zero(paid_cur):
                 if sheet_name not in cells_by_sheet:
                     cells_by_sheet[sheet_name] = []
+                if sheet_name not in pending_by_sheet:
+                    pending_by_sheet[sheet_name] = []
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=18, value=amount))
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Broker paid"))
                 updated += 1
                 results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "FOUND"})
+                pending_by_sheet[sheet_name].append((len(results) - 1, row_num, amount))
             else:
                 skipped += 1
                 results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "ALREADY FILLED"})
@@ -398,7 +403,29 @@ class GoogleSheetService:
         for sn, cells in cells_by_sheet.items():
             ws = self.get_load_board(sn, company)
             if ws and cells:
-                self._retry_on_429(ws.update_cells, cells)
+                try:
+                    self._retry_on_429(ws.update_cells, cells)
+                except Exception as e:
+                    err = str(e).lower()
+                    # Protected range bo'lsa batch yiqiladi; qatorma-qator tekshirib reportga status qo'yamiz.
+                    if "protected" in err:
+                        for result_idx, row_num, amount in pending_by_sheet.get(sn, []):
+                            try:
+                                self._retry_on_429(ws.update_cell, row_num, 18, amount)
+                                self._retry_on_429(ws.update_cell, row_num, 15, "Broker paid")
+                            except Exception as row_e:
+                                row_err = str(row_e).lower()
+                                if "protected" in row_err:
+                                    results[result_idx]["Status"] = "PROTECTED CELL"
+                                else:
+                                    results[result_idx]["Status"] = "ERROR"
+                                updated = max(0, updated - 1)
+                                skipped += 1
+                    else:
+                        for result_idx, _, _ in pending_by_sheet.get(sn, []):
+                            results[result_idx]["Status"] = "ERROR"
+                        skipped += len(pending_by_sheet.get(sn, []))
+                        updated = max(0, updated - len(pending_by_sheet.get(sn, [])))
 
         return (updated, skipped, not_found, results)
 

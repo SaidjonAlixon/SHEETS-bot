@@ -183,7 +183,7 @@ async def handle_broker_document(message: types.Message):
                             cell.fill = green_fill
                         elif "ALREADY FILLED" in v:
                             cell.fill = yellow_fill
-                        elif "NOT FOUND" in v or "EMPTY" in v:
+                        elif "NOT FOUND" in v or "EMPTY" in v or "PROTECTED" in v:
                             cell.fill = red_fill
                     wb.save(report_filename)
             except Exception:
@@ -310,11 +310,11 @@ async def handle_broker_document(message: types.Message):
                 for r in range(2, ws_rep.max_row + 1):
                     cell = ws_rep.cell(row=r, column=status_col)
                     v = str(cell.value or "").upper()
-                    if "UPDATED" in v:
+                    if "UPDATED" in v or ("FOUND" in v and "NOT FOUND" not in v):
                         cell.fill = green_fill
-                    elif "SKIPPED" in v:
+                    elif "SKIPPED" in v or "ALREADY FILLED" in v:
                         cell.fill = yellow_fill
-                    elif "NOT FOUND" in v or "EMPTY" in v:
+                    elif "NOT FOUND" in v or "EMPTY" in v or "PROTECTED" in v:
                         cell.fill = red_fill
                 wb.save(report_filename)
         except Exception:
