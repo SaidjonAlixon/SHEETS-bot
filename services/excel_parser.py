@@ -124,9 +124,10 @@ class ExcelParser:
     def parse_purchase_history_report(file_content):
         """
         Purchase History Details Report (sanalar yo'q).
-        D: Load/PO #, H: Funded Amount.
+        D: Load/PO #, F: Fee, H: Funded Amount.
         Bir xil Load ID bir necha marta bo'lsa — summani yig'adi (umumiy).
         Qaytaradi: [{'load_number': '...', 'amount': summa}, ...] — har load uchun 1 ta.
+        amount = Funded Amount + Fee.
         """
         try:
             try:
@@ -135,32 +136,41 @@ class ExcelParser:
                 df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
             df.columns = [str(c).strip() for c in df.columns]
             load_col = None
+            fee_col = None
             funded_col = None
             for i, col in enumerate(df.columns):
                 col_lower = str(col).lower()
                 if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or 'number' in col_lower):
                     load_col = col
+                elif col_lower == 'fee' or ('fee' in col_lower and 'funded' not in col_lower):
+                    fee_col = col
                 elif 'funded amount' in col_lower or ('funded' in col_lower and 'amount' in col_lower):
                     funded_col = col
             if load_col is None and len(df.columns) > 3:
                 load_col = df.columns[3]
+            if fee_col is None and len(df.columns) > 5:
+                fee_col = df.columns[5]
             if funded_col is None and len(df.columns) > 7:
                 funded_col = df.columns[7]
             if load_col is None or funded_col is None:
                 return []
             aggregated = {}
+
+            def _to_amount(v):
+                if pd.isna(v):
+                    return 0.0
+                s = str(v).strip().replace(',', '.')
+                m = re.search(r'-?\d+\.?\d*', s)
+                return float(m.group()) if m else 0.0
+
             for _, row in df.iterrows():
                 load_num = row.get(load_col)
                 if pd.isna(load_num) or not str(load_num).strip() or str(load_num).strip().lower() == 'nan':
                     continue
                 load_str = str(load_num).strip()
-                val = row.get(funded_col)
-                amount = 0.0
-                if pd.notna(val):
-                    s = str(val).strip().replace(',', '.')
-                    m = re.search(r'-?\d+\.?\d*', s)
-                    if m:
-                        amount = float(m.group())
+                funded_amount = _to_amount(row.get(funded_col))
+                fee_amount = _to_amount(row.get(fee_col)) if fee_col else 0.0
+                amount = funded_amount + fee_amount
                 aggregated[load_str] = aggregated.get(load_str, 0) + amount
             return [{'load_number': k, 'amount': v} for k, v in aggregated.items()]
         except Exception as e:
