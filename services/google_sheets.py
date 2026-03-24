@@ -241,6 +241,167 @@ class GoogleSheetService:
             result = [n for n in self.get_all_sheet_names(company) if n.lower() != 'dashboard']
         return result
 
+    def get_last_n_week_sheets(self, n=10, company=None):
+        """Eng yangi n ta hafta (sana oralig'i bo'lgan) sheetlar. Oxirgi 10 hafta."""
+        names = self.get_date_sheet_names(company)
+        if not names:
+            return []
+        range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
+        year_re = re.compile(r'(\d{4})')
+        now = datetime.now()
+        year = now.year
+
+        def _sort_key(name):
+            m = range_re.search(name)
+            if not m:
+                return (0, 0, 0)
+            start_str, end_str = m.group(1), m.group(2)
+            y_m = year_re.search(name)
+            y = int(y_m.group(1)) if y_m else year
+            try:
+                end_m, end_d = map(int, end_str.split('.'))
+                if not y_m and end_m > now.month:
+                    y = year - 1
+                return (y, end_m, end_d)
+            except (ValueError, TypeError):
+                return (0, 0, 0)
+
+        sorted_names = sorted(names, key=_sort_key, reverse=True)
+        return sorted_names[:n]
+
+    def update_factoring_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+        """
+        Bir nechta sheetda Load # ni qidirib, topilganiga summani yozadi.
+        sheet_names: qidiriladigan sheetlar (eng yangi 10 hafta).
+        Qaytaradi: (updated, skipped, not_found, results).
+        """
+        if not sheet_names or not parsed_data:
+            return (0, 0, len(parsed_data), [])
+
+        load_to_sheet_row = {}  # normalized_load -> (sheet_name, row_num, inv_cur_value)
+        for sn in sheet_names:
+            sheet = self.get_load_board(sn, company)
+            if not sheet:
+                continue
+            try:
+                all_rows = self._retry_on_429(sheet.get_all_values)
+            except Exception:
+                continue
+            for i in range(start_row - 1, len(all_rows)):
+                row = all_rows[i] if i < len(all_rows) else []
+                for col in load_cols:
+                    val = row[col - 1] if len(row) >= col else ""
+                    norm = self._normalize_load_num(val)
+                    if norm and norm not in load_to_sheet_row:
+                        inv_cur = row[15] if len(row) > 15 else ""  # P ustuni = 16, index 15
+                        load_to_sheet_row[norm] = (sn, i + 1, inv_cur)
+                        break
+
+        results = []
+        cells_by_sheet = {}
+        updated = 0
+        skipped = 0
+        not_found = 0
+
+        for item in parsed_data:
+            load_num = item.get("load_number", "") or ""
+            amount = item.get("amount") or 0
+            if not str(load_num).strip():
+                results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": "-", "Status": "EMPTY LOAD #"})
+                continue
+
+            target = self._normalize_load_num(load_num)
+            found = load_to_sheet_row.get(target)
+            if not found:
+                not_found += 1
+                results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": "-", "Status": "LOAD NOT FOUND"})
+                continue
+
+            sheet_name, row_num, inv_cur = found
+            if self._is_empty_or_zero(inv_cur):
+                if sheet_name not in cells_by_sheet:
+                    cells_by_sheet[sheet_name] = []
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=16, value=amount))
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Invoiced"))
+                updated += 1
+                results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "UPDATED"})
+            else:
+                skipped += 1
+                results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "SKIPPED"})
+
+        for sn, cells in cells_by_sheet.items():
+            ws = self.get_load_board(sn, company)
+            if ws and cells:
+                self._retry_on_429(ws.update_cells, cells)
+
+        return (updated, skipped, not_found, results)
+
+    def update_broker_payment_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+        """
+        Oxirgi 10 hafta sheetlarida Load # ni qidirib, Funded Amount ni R (BROKER PAID) ga yozadi.
+        parsed_data: [{'load_number': '...', 'amount': summa}, ...] — bitta load uchun bitta, umumiy summa.
+        """
+        if not sheet_names or not parsed_data:
+            return (0, 0, len(parsed_data) if parsed_data else 0, [])
+
+        load_to_sheet_row = {}
+        for sn in sheet_names:
+            sheet = self.get_load_board(sn, company)
+            if not sheet:
+                continue
+            try:
+                all_rows = self._retry_on_429(sheet.get_all_values)
+            except Exception:
+                continue
+            for i in range(start_row - 1, len(all_rows)):
+                row = all_rows[i] if i < len(all_rows) else []
+                for col in load_cols:
+                    val = row[col - 1] if len(row) >= col else ""
+                    norm = self._normalize_load_num(val)
+                    if norm and norm not in load_to_sheet_row:
+                        paid_cur = row[17] if len(row) > 17 else ""
+                        load_to_sheet_row[norm] = (sn, i + 1, paid_cur)
+                        break
+
+        results = []
+        cells_by_sheet = {}
+        updated = 0
+        skipped = 0
+        not_found = 0
+
+        for item in parsed_data:
+            load_num = item.get("load_number", "") or ""
+            amount = item.get("amount") or 0
+            if not str(load_num).strip():
+                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": "-", "Status": "EMPTY LOAD #"})
+                continue
+
+            target = self._normalize_load_num(load_num)
+            found = load_to_sheet_row.get(target)
+            if not found:
+                not_found += 1
+                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": "-", "Status": "LOAD NOT FOUND"})
+                continue
+
+            sheet_name, row_num, paid_cur = found
+            if self._is_empty_or_zero(paid_cur):
+                if sheet_name not in cells_by_sheet:
+                    cells_by_sheet[sheet_name] = []
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=18, value=amount))
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Broker paid"))
+                updated += 1
+                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": sheet_name, "Status": "UPDATED"})
+            else:
+                skipped += 1
+                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": sheet_name, "Status": "SKIPPED"})
+
+        for sn, cells in cells_by_sheet.items():
+            ws = self.get_load_board(sn, company)
+            if ws and cells:
+                self._retry_on_429(ws.update_cells, cells)
+
+        return (updated, skipped, not_found, results)
+
     async def find_load_in_any_sheet_async(self, load_number, sheet_names=None, company=None):
         """Barcha date sheetlarda Load # ni qidiradi. Topilmasa - (None, None)."""
         import asyncio

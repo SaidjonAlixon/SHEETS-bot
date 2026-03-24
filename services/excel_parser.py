@@ -73,8 +73,8 @@ class ExcelParser:
     @staticmethod
     def parse_factoring_report(file_content):
         """
-        Factoring Payments fayli (1-rasm format).
-        D: Load/PO #, E: Invoice Amount
+        Factoring Payments fayli.
+        Qo'llab-quvvatlanadi: Load/PO #, Load Number (B); Invoice Amount, Invoice Amt (E yoki H)
         Qaytaradi: [{'load_number': '...', 'amount': ...}, ...]
         """
         try:
@@ -83,16 +83,20 @@ class ExcelParser:
             except Exception:
                 df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
             df.columns = [str(c).strip() for c in df.columns]
-            load_col = None  # D - Load/PO #
-            inv_col = None   # E - Invoice Amount
+            load_col = None
+            inv_col = None
             for i, col in enumerate(df.columns):
                 col_lower = str(col).lower()
-                if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or i == 3):
+                # Load: Load/PO #, Load Number, Load # va hokazo
+                if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or 'number' in col_lower or i == 3):
                     load_col = col
-                elif 'invoice amount' in col_lower or (i == 4 and 'amount' in col_lower):
+                # Invoice: Invoice Amount, Invoice Amt
+                elif 'invoice' in col_lower and ('amount' in col_lower or 'amt' in col_lower) or (i == 4 and 'amount' in col_lower):
                     inv_col = col
-            if load_col is None and len(df.columns) > 3:
-                load_col = df.columns[3]
+            if load_col is None and len(df.columns) > 1:
+                load_col = df.columns[1]  # B - odatda Load Number
+            if inv_col is None and len(df.columns) > 7:
+                inv_col = df.columns[7]  # H - odatda Invoice Amt
             if inv_col is None and len(df.columns) > 4:
                 inv_col = df.columns[4]
             if load_col is None or inv_col is None:
@@ -114,6 +118,53 @@ class ExcelParser:
             return results
         except Exception as e:
             print(f"parse_factoring_report error: {e}")
+            return []
+
+    @staticmethod
+    def parse_purchase_history_report(file_content):
+        """
+        Purchase History Details Report (sanalar yo'q).
+        D: Load/PO #, H: Funded Amount.
+        Bir xil Load ID bir necha marta bo'lsa — summani yig'adi (umumiy).
+        Qaytaradi: [{'load_number': '...', 'amount': summa}, ...] — har load uchun 1 ta.
+        """
+        try:
+            try:
+                df = pd.read_excel(io.BytesIO(file_content))
+            except Exception:
+                df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
+            df.columns = [str(c).strip() for c in df.columns]
+            load_col = None
+            funded_col = None
+            for i, col in enumerate(df.columns):
+                col_lower = str(col).lower()
+                if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or 'number' in col_lower):
+                    load_col = col
+                elif 'funded amount' in col_lower or ('funded' in col_lower and 'amount' in col_lower):
+                    funded_col = col
+            if load_col is None and len(df.columns) > 3:
+                load_col = df.columns[3]
+            if funded_col is None and len(df.columns) > 7:
+                funded_col = df.columns[7]
+            if load_col is None or funded_col is None:
+                return []
+            aggregated = {}
+            for _, row in df.iterrows():
+                load_num = row.get(load_col)
+                if pd.isna(load_num) or not str(load_num).strip() or str(load_num).strip().lower() == 'nan':
+                    continue
+                load_str = str(load_num).strip()
+                val = row.get(funded_col)
+                amount = 0.0
+                if pd.notna(val):
+                    s = str(val).strip().replace(',', '.')
+                    m = re.search(r'-?\d+\.?\d*', s)
+                    if m:
+                        amount = float(m.group())
+                aggregated[load_str] = aggregated.get(load_str, 0) + amount
+            return [{'load_number': k, 'amount': v} for k, v in aggregated.items()]
+        except Exception as e:
+            print(f"parse_purchase_history_report error: {e}")
             return []
 
     @staticmethod

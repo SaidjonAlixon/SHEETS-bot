@@ -239,7 +239,7 @@ async def handle_factoring_document(message: types.Message, state: FSMContext):
         await message.answer("Iltimos, faqat Excel (xlsx, xls) fayl yuklang.")
         return
 
-    await message.answer("Fayl qabul qilindi. Yuklanmoqda... ⏳")
+    await message.answer("Fayl qabul qilindi. Oxirgi 10 hafta listlarida Load # qidirilmoqda... ⏳")
 
     file = await bot.get_file(file_id)
     file_content = await bot.download_file(file.file_path)
@@ -253,51 +253,11 @@ async def handle_factoring_document(message: types.Message, state: FSMContext):
         await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D (Load/PO #) va E (Invoice Amount) ustunlarini tekshiring.")
         return
 
-    all_sheets = []
-    try:
-        sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
-    except Exception:
-        pass
-
-    await state.update_data(
-        factoring_file=content_bytes,
-        factoring_filename=file_name,
-        factoring_parsed=parsed_data,
-        factoring_sheet_names=all_sheets,
-        selected_company=company
-    )
-    await state.set_state(BotStates.FactoringDateRange)
-
-    if all_sheets:
-        # Inline tugmalar: har bir list uchun tugma (2 ta qatorda)
-        buttons = []
-        row = []
-        for i, name in enumerate(all_sheets):
-            # callback_data 64 belgidan oshmasligi kerak; indeks orqali yuboramiz
-            row.append(InlineKeyboardButton(text=name, callback_data=f"fs:{i}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await message.answer(
-            f"✅ Fayl qabul qilindi ({len(parsed_data)} ta yozuv).\n\n"
-            f"<b>Qaysi listni tanlaysiz?</b> Quyidagi tugmalardan birini bosing:",
-            reply_markup=kb
-        )
-    else:
-        await message.answer(
-            f"✅ Fayl qabul qilindi ({len(parsed_data)} ta yozuv).\n\n"
-            f"<b>Qaysi oydan qaysi oygacha tekshiray?</b>\n"
-            f"List nomini yozing (masalan: 10.08-10.15)",
-            reply_markup=factoring_menu
-        )
+    await _process_factoring_auto(parsed_data, file_name, state, message.chat.id, company)
 
 
-async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name: str, state: FSMContext, chat_id: int, company: str):
-    """Tanlangan list uchun factoring ma'lumotlarini sheetga yozish. Batch — Fuel/Toll kabi tez."""
+async def _process_factoring_auto(parsed_data: list, file_name: str, state: FSMContext, chat_id: int, company: str):
+    """Oxirgi 10 hafta listlarida Load # qidirib, topilgan joyga summani yozadi. List tanlash yo'q."""
     try:
         sheet_service = get_sheet_service()
     except Exception as e:
@@ -307,16 +267,15 @@ async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name
             await bot.send_message(chat_id, f"Xatolik: {e}")
         return
 
-    ws = sheet_service.get_load_board(sheet_name, company)
-    if not ws:
-        await bot.send_message(chat_id, f"❌ «{sheet_name}» nomli list topilmadi.")
+    sheet_names = sheet_service.get_last_n_week_sheets(n=10, company=company)
+    if not sheet_names:
+        await bot.send_message(chat_id, "❌ Sana oralig'i bo'lgan listlar topilmadi.")
         return
 
-    updated_count, skipped_count, not_found_count, results = sheet_service.update_factoring_batch(
-        sheet_name, parsed_data, company=company
+    updated_count, skipped_count, not_found_count, results = sheet_service.update_factoring_across_sheets(
+        sheet_names, parsed_data, company=company
     )
 
-    await state.clear()
     await state.set_state(BotStates.Factoring)
 
     result_df = pd.DataFrame(results)
@@ -326,7 +285,6 @@ async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name
     tmp.close()
     result_df.to_excel(report_filename, index=False)
 
-    # Status ustunini ranglash: UPDATED=yashil, SKIPPED=sariq, LOAD NOT FOUND=qizil
     try:
         from openpyxl import load_workbook
         from openpyxl.styles import PatternFill
@@ -335,7 +293,7 @@ async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name
         ws_rep = wb.active
         status_col = None
         for c in range(1, ws_rep.max_column + 1):
-            if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
+            if str(ws_rep.cell(row=1, column=c).value or "").strip() == "Status":
                 status_col = c
                 break
         if status_col:
@@ -355,9 +313,10 @@ async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name
     except Exception:
         pass
 
+    sheet_list = ", ".join(sheet_names[:5]) + (" ..." if len(sheet_names) > 5 else "")
     await bot.send_message(
         chat_id,
-        f"✅ Factoring yakunlandi: <b>{sheet_name}</b>\n\n"
+        f"✅ Factoring yakunlandi (oxirgi 10 hafta: {sheet_list})\n\n"
         f"Yangilandi: {updated_count}\nO'tkazib yuborildi: {skipped_count}\nTopilmadi: {not_found_count}",
         reply_markup=factoring_menu
     )
@@ -365,49 +324,3 @@ async def _process_factoring_sheet(sheet_name: str, parsed_data: list, file_name
     os.remove(report_filename)
 
 
-@dp.callback_query(F.data.startswith("fs:"), BotStates.FactoringDateRange)
-async def handle_factoring_sheet_select(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    data = await state.get_data()
-    company = data.get("selected_company") or get_company(callback.from_user.id)
-    if not company:
-        await callback.message.edit_text("Iltimos, /start bosing va Load tanlang.")
-        return
-    idx_str = callback.data.replace("fs:", "").strip()
-    try:
-        idx = int(idx_str)
-    except ValueError:
-        return
-    sheet_names = data.get("factoring_sheet_names") or []
-    parsed_data = data.get("factoring_parsed")
-    file_name = data.get("factoring_filename", "report.xlsx")
-    if idx < 0 or idx >= len(sheet_names) or not parsed_data:
-        await callback.message.edit_text("❌ Ma'lumotlar eski. Qaytadan fayl yuboring.", reply_markup=None)
-        await state.set_state(BotStates.Factoring)
-        return
-    sheet_name = sheet_names[idx]
-    await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...", reply_markup=None)
-    await _process_factoring_sheet(sheet_name, parsed_data, file_name, state, callback.message.chat.id, company)
-
-
-@dp.message(F.text, BotStates.FactoringDateRange)
-async def handle_factoring_date_range(message: types.Message, state: FSMContext):
-    sheet_name = message.text.strip()
-    if not sheet_name:
-        await message.answer("Iltimos, list nomini kiriting yoki yuqoridagi tugmalardan birini bosing.")
-        return
-
-    data = await state.get_data()
-    parsed_data = data.get('factoring_parsed')
-    file_name = data.get('factoring_filename', 'report.xlsx')
-    company = data.get("selected_company") or get_company(message.from_user.id)
-    if not company:
-        await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
-        return
-
-    if not parsed_data:
-        await state.set_state(BotStates.Factoring)
-        await message.answer("Fayl ma'lumotlari topilmadi. Qaytadan fayl yuboring.", reply_markup=factoring_menu)
-        return
-
-    await _process_factoring_sheet(sheet_name, parsed_data, file_name, state, message.chat.id, company)

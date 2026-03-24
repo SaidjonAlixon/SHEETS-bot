@@ -126,24 +126,76 @@ async def handle_broker_document(message: types.Message):
         await message.answer("Iltimos, faqat Excel (xlsx, xls) fayl yuklang.")
         return
 
-    await message.answer("⏳ Kutib turing, natija tez orada chiqadi...")
+    await message.answer("⏳ Oxirgi 10 hafta listlarida Load # qidirilmoqda...")
 
     file = await bot.get_file(file_id)
     file_content = await bot.download_file(file.file_path)
     content_bytes = file_content.read()
 
-    parsed_data = ExcelParser.parse_broker_payments_xls(content_bytes)
+    parsed_data = ExcelParser.parse_purchase_history_report(content_bytes)
+    use_purchase_history_flow = bool(parsed_data)
+    if not parsed_data:
+        parsed_data = ExcelParser.parse_broker_payments_xls(content_bytes)
     if not parsed_data:
         parsed_data = ExcelParser.parse_broker_report(content_bytes)
     if not parsed_data:
         parsed_data = ExcelParser.parse_invoice(content_bytes)
 
     if not parsed_data:
-        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. B (Load Number), C (Purchase Date), H (Invoice Amount) ustunlarini tekshiring.")
+        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D (Load/PO #), H (Funded Amount) yoki B, C, H ustunlarini tekshiring.")
         return
 
     try:
         sheet_service = get_sheet_service()
+        if use_purchase_history_flow:
+            sheet_names = sheet_service.get_last_n_week_sheets(n=10, company=company)
+            if not sheet_names:
+                await message.answer("❌ Sana oralig'i bo'lgan listlar topilmadi.")
+                return
+            updated, skipped, not_found, results = sheet_service.update_broker_payment_across_sheets(
+                sheet_names, parsed_data, company=company
+            )
+            result_df = pd.DataFrame(results)
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            report_filename = tmp.name
+            tmp.close()
+            result_df.to_excel(report_filename, index=False)
+            try:
+                from openpyxl import load_workbook
+                from openpyxl.styles import PatternFill
+                wb = load_workbook(report_filename)
+                ws_rep = wb.active
+                status_col = None
+                for c in range(1, ws_rep.max_column + 1):
+                    if str(ws_rep.cell(row=1, column=c).value or "").strip() == "Status":
+                        status_col = c
+                        break
+                if status_col:
+                    green_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
+                    yellow_fill = PatternFill(start_color="F9A825", end_color="F9A825", fill_type="solid")
+                    red_fill = PatternFill(start_color="C62828", end_color="C62828", fill_type="solid")
+                    for r in range(2, ws_rep.max_row + 1):
+                        cell = ws_rep.cell(row=r, column=status_col)
+                        v = str(cell.value or "").upper()
+                        if "UPDATED" in v:
+                            cell.fill = green_fill
+                        elif "SKIPPED" in v:
+                            cell.fill = yellow_fill
+                        elif "NOT FOUND" in v or "EMPTY" in v:
+                            cell.fill = red_fill
+                    wb.save(report_filename)
+            except Exception:
+                pass
+            sheet_list = ", ".join(sheet_names[:5]) + (" ..." if len(sheet_names) > 5 else "")
+            await message.answer(
+                f"✅ Broker Payments yakunlandi (oxirgi 10 hafta: {sheet_list})\n\n"
+                f"Yangilandi: {updated}\nO'tkazib yuborildi: {skipped}\nTopilmadi: {not_found}",
+                reply_markup=broker_menu
+            )
+            await message.answer_document(types.FSInputFile(report_filename))
+            os.remove(report_filename)
+            return
         all_sheet_names = sheet_service.get_all_sheet_names(company)
         date_sheet_names = sheet_service.get_date_sheet_names(company)
     except GspreadAPIError as e:
