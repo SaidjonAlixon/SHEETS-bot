@@ -132,22 +132,23 @@ async def handle_broker_document(message: types.Message):
     file_content = await bot.download_file(file.file_path)
     content_bytes = file_content.read()
 
-    parsed_data = ExcelParser.parse_purchase_history_report(content_bytes)
-    use_purchase_history_flow = bool(parsed_data)
+    parsed_data = ExcelParser.parse_broker_payments_xls(content_bytes)
+    use_last_10_weeks_flow = bool(parsed_data)
     if not parsed_data:
-        parsed_data = ExcelParser.parse_broker_payments_xls(content_bytes)
+        parsed_data = ExcelParser.parse_purchase_history_report(content_bytes)
+        use_last_10_weeks_flow = bool(parsed_data)
     if not parsed_data:
         parsed_data = ExcelParser.parse_broker_report(content_bytes)
     if not parsed_data:
         parsed_data = ExcelParser.parse_invoice(content_bytes)
 
     if not parsed_data:
-        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D (Load/PO #), H (Funded Amount) yoki B, C, H ustunlarini tekshiring.")
+        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D/B (Load ID) va J (Check Amount) ustunlarini tekshiring.")
         return
 
     try:
         sheet_service = get_sheet_service()
-        if use_purchase_history_flow:
+        if use_last_10_weeks_flow:
             sheet_names = sheet_service.get_last_n_week_sheets(n=10, company=company)
             if not sheet_names:
                 await message.answer("❌ Sana oralig'i bo'lgan listlar topilmadi.")
@@ -178,9 +179,9 @@ async def handle_broker_document(message: types.Message):
                     for r in range(2, ws_rep.max_row + 1):
                         cell = ws_rep.cell(row=r, column=status_col)
                         v = str(cell.value or "").upper()
-                        if "UPDATED" in v:
+                        if "FOUND" in v and "NOT FOUND" not in v:
                             cell.fill = green_fill
-                        elif "SKIPPED" in v:
+                        elif "ALREADY FILLED" in v:
                             cell.fill = yellow_fill
                         elif "NOT FOUND" in v or "EMPTY" in v:
                             cell.fill = red_fill

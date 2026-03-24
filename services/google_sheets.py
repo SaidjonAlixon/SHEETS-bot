@@ -373,14 +373,14 @@ class GoogleSheetService:
             load_num = item.get("load_number", "") or ""
             amount = item.get("amount") or 0
             if not str(load_num).strip():
-                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": "-", "Status": "EMPTY LOAD #"})
+                results.append({"Load #": load_num, "Check Amount": amount, "Sheet": "-", "Status": "EMPTY LOAD #"})
                 continue
 
             target = self._normalize_load_num(load_num)
             found = load_to_sheet_row.get(target)
             if not found:
                 not_found += 1
-                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": "-", "Status": "LOAD NOT FOUND"})
+                results.append({"Load #": load_num, "Check Amount": amount, "Sheet": "-", "Status": "NOT FOUND"})
                 continue
 
             sheet_name, row_num, paid_cur = found
@@ -390,10 +390,10 @@ class GoogleSheetService:
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=18, value=amount))
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Broker paid"))
                 updated += 1
-                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": sheet_name, "Status": "UPDATED"})
+                results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "FOUND"})
             else:
                 skipped += 1
-                results.append({"Load #": load_num, "Funded Amount": amount, "Sheet": sheet_name, "Status": "SKIPPED"})
+                results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "ALREADY FILLED"})
 
         for sn, cells in cells_by_sheet.items():
             ws = self.get_load_board(sn, company)

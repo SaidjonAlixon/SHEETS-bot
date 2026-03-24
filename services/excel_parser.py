@@ -74,7 +74,7 @@ class ExcelParser:
     def parse_factoring_report(file_content):
         """
         Factoring Payments fayli.
-        Qo'llab-quvvatlanadi: Load/PO #, Load Number (B); Invoice Amount, Invoice Amt (E yoki H)
+        Qo'llab-quvvatlanadi: Load/PO # (D), Load Number; faqat Funded Amount (H).
         Qaytaradi: [{'load_number': '...', 'amount': ...}, ...]
         """
         try:
@@ -84,22 +84,20 @@ class ExcelParser:
                 df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
             df.columns = [str(c).strip() for c in df.columns]
             load_col = None
-            inv_col = None
+            funded_col = None
             for i, col in enumerate(df.columns):
                 col_lower = str(col).lower()
                 # Load: Load/PO #, Load Number, Load # va hokazo
                 if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or 'number' in col_lower or i == 3):
                     load_col = col
-                # Invoice: Invoice Amount, Invoice Amt
-                elif 'invoice' in col_lower and ('amount' in col_lower or 'amt' in col_lower) or (i == 4 and 'amount' in col_lower):
-                    inv_col = col
+                # Factoring uchun ustuvor: Funded Amount (H)
+                elif 'funded amount' in col_lower or ('funded' in col_lower and 'amount' in col_lower):
+                    funded_col = col
             if load_col is None and len(df.columns) > 1:
                 load_col = df.columns[1]  # B - odatda Load Number
-            if inv_col is None and len(df.columns) > 7:
-                inv_col = df.columns[7]  # H - odatda Invoice Amt
-            if inv_col is None and len(df.columns) > 4:
-                inv_col = df.columns[4]
-            if load_col is None or inv_col is None:
+            if funded_col is None and len(df.columns) > 7:
+                funded_col = df.columns[7]  # H - odatda Funded Amount
+            if load_col is None or funded_col is None:
                 return []
             results = []
             for _, row in df.iterrows():
@@ -107,7 +105,7 @@ class ExcelParser:
                 if pd.isna(load_num) or not str(load_num).strip() or str(load_num).strip().lower() == 'nan':
                     continue
                 load_str = str(load_num).strip()
-                inv_val = row.get(inv_col)
+                inv_val = row.get(funded_col)
                 amount_val = 0.0
                 if pd.notna(inv_val):
                     s = str(inv_val).strip().replace(',', '.')
@@ -181,8 +179,10 @@ class ExcelParser:
     def parse_broker_payments_xls(file_content):
         """
         Broker Payments .xls faylini o'qish (1-rasm format).
-        B: Load Number, C: Purchase Date, H: Invoice Amount
-        Invoice Amount format: "1400 C/B", "3500 Pmt" - raqamni ajratib oladi.
+        Asosiy format:
+        - Load ID: D (Load #/Load/PO #) yoki B (Load Number)
+        - Amount: faqat J (Check Amount)
+        - Date: C (ixtiyoriy)
         """
         try:
             try:
@@ -193,29 +193,31 @@ class ExcelParser:
             # Ustun nomlarini normallashtirish
             df.columns = [str(c).strip() for c in df.columns]
             
-            # B, C, H - nomlar orqali yoki index orqali
-            load_col = None   # B - Load Number
-            date_col = None   # C - Purchase Date
-            inv_col = None    # H - Invoice Amount
+            # D/B, C, J/H - nomlar orqali yoki index orqali
+            load_col = None
+            date_col = None
+            check_col = None
             
             for i, col in enumerate(df.columns):
                 col_lower = str(col).lower()
-                if 'load number' in col_lower or (i == 1 and 'load' in col_lower):
+                if 'load/po #' in col_lower or 'load #' in col_lower or 'load number' in col_lower or (i in (1, 3) and 'load' in col_lower):
                     load_col = col
                 elif 'purchase date' in col_lower or 'payment date' in col_lower or (i in (2, 3) and 'date' in col_lower):
                     date_col = col
-                elif 'invoice amount' in col_lower or (i == 7 and 'amount' in col_lower):
-                    inv_col = col
+                elif 'check amount' in col_lower or (i == 9 and 'amount' in col_lower):
+                    check_col = col
             
-            # Agar nom topilmasa - index orqali (B=1, C=2, H=7, 0-based)
+            # Agar nom topilmasa - index orqali (D=3, B=1, C=2, J=9, H=7)
+            if load_col is None and len(df.columns) > 3:
+                load_col = df.columns[3]
             if load_col is None and len(df.columns) > 1:
                 load_col = df.columns[1]
             if date_col is None and len(df.columns) > 2:
                 date_col = df.columns[2]
-            if inv_col is None and len(df.columns) > 7:
-                inv_col = df.columns[7]
+            if check_col is None and len(df.columns) > 9:
+                check_col = df.columns[9]
             
-            if load_col is None or inv_col is None:
+            if load_col is None or check_col is None:
                 return []
             
             results = []
@@ -233,7 +235,7 @@ class ExcelParser:
                     except Exception:
                         pass
                 
-                inv_val = row.get(inv_col)
+                inv_val = row.get(check_col)
                 amount_val = 0.0
                 if pd.notna(inv_val):
                     s = str(inv_val).strip()
