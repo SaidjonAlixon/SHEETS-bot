@@ -186,7 +186,8 @@ class ExcelParser:
         """
         try:
             try:
-                df = pd.read_excel(io.BytesIO(file_content))
+                # Tezlik uchun faqat kerakli ustunlarni o'qiymiz: B,C,D va J
+                df = pd.read_excel(io.BytesIO(file_content), usecols=[1, 2, 3, 9], dtype=str)
             except Exception:
                 df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
             

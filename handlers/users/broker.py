@@ -11,9 +11,7 @@ from states.bot_states import BotStates
 from utils.company_storage import get_company
 import pandas as pd
 import os
-import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -126,167 +124,43 @@ async def handle_broker_document(message: types.Message):
         await message.answer("Iltimos, faqat Excel (xlsx, xls) fayl yuklang.")
         return
 
-    await message.answer("⏳ Oxirgi 10 hafta listlarida Load # qidirilmoqda...")
+    progress_msg = await message.answer("⏳ Broker fayl qabul qilindi... 10%")
 
     file = await bot.get_file(file_id)
     file_content = await bot.download_file(file.file_path)
     content_bytes = file_content.read()
+    try:
+        await progress_msg.edit_text("⏳ Broker fayl o'qilmoqda... 30%")
+    except Exception:
+        pass
 
     parsed_data = ExcelParser.parse_broker_payments_xls(content_bytes)
-    use_last_10_weeks_flow = bool(parsed_data)
     if not parsed_data:
         parsed_data = ExcelParser.parse_purchase_history_report(content_bytes)
-        use_last_10_weeks_flow = bool(parsed_data)
-    if not parsed_data:
-        parsed_data = ExcelParser.parse_broker_report(content_bytes)
-    if not parsed_data:
-        parsed_data = ExcelParser.parse_invoice(content_bytes)
 
     if not parsed_data:
         await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D/B (Load ID) va J (Check Amount) ustunlarini tekshiring.")
         return
 
     try:
+        try:
+            await progress_msg.edit_text("⏳ Oxirgi 10 hafta listlari tayyorlanmoqda... 50%")
+        except Exception:
+            pass
         sheet_service = get_sheet_service()
-        if use_last_10_weeks_flow:
-            sheet_names = sheet_service.get_last_n_week_sheets(n=10, company=company)
-            if not sheet_names:
-                await message.answer("❌ Sana oralig'i bo'lgan listlar topilmadi.")
-                return
-            updated, skipped, not_found, results = sheet_service.update_broker_payment_across_sheets(
-                sheet_names, parsed_data, company=company
-            )
-            result_df = pd.DataFrame(results)
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            report_filename = tmp.name
-            tmp.close()
-            result_df.to_excel(report_filename, index=False)
-            try:
-                from openpyxl import load_workbook
-                from openpyxl.styles import PatternFill
-                wb = load_workbook(report_filename)
-                ws_rep = wb.active
-                status_col = None
-                for c in range(1, ws_rep.max_column + 1):
-                    if str(ws_rep.cell(row=1, column=c).value or "").strip() == "Status":
-                        status_col = c
-                        break
-                if status_col:
-                    green_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
-                    yellow_fill = PatternFill(start_color="F9A825", end_color="F9A825", fill_type="solid")
-                    red_fill = PatternFill(start_color="C62828", end_color="C62828", fill_type="solid")
-                    for r in range(2, ws_rep.max_row + 1):
-                        cell = ws_rep.cell(row=r, column=status_col)
-                        v = str(cell.value or "").upper()
-                        if "FOUND" in v and "NOT FOUND" not in v:
-                            cell.fill = green_fill
-                        elif "ALREADY FILLED" in v:
-                            cell.fill = yellow_fill
-                        elif "NOT FOUND" in v or "EMPTY" in v or "PROTECTED" in v:
-                            cell.fill = red_fill
-                    wb.save(report_filename)
-            except Exception:
-                pass
-            sheet_list = ", ".join(sheet_names[:5]) + (" ..." if len(sheet_names) > 5 else "")
-            await message.answer(
-                f"✅ Broker Payments yakunlandi (oxirgi 10 hafta: {sheet_list})\n\n"
-                f"Yangilandi: {updated}\nO'tkazib yuborildi: {skipped}\nTopilmadi: {not_found}",
-                reply_markup=broker_menu
-            )
-            await message.answer_document(types.FSInputFile(report_filename))
-            os.remove(report_filename)
+        sheet_names = sheet_service.get_last_n_week_sheets(n=10, company=company)
+        if not sheet_names:
+            await message.answer("❌ Sana oralig'i bo'lgan listlar topilmadi.")
             return
-        all_sheet_names = sheet_service.get_all_sheet_names(company)
-        date_sheet_names = sheet_service.get_date_sheet_names(company)
-    except GspreadAPIError as e:
-        if "429" in str(e):
-            await message.answer("⚠️ Google Sheets limiti tugadi. 1-2 daqiqa kutib qayta yuboring.")
-        else:
-            await message.answer(f"Sheet xatolik: {e}")
-        return
-    except Exception as e:
-        logger.exception("Broker: sheet init xatosi")
-        await message.answer(f"Xatolik: {e}")
-        return
+        try:
+            await progress_msg.edit_text("⏳ Load # qidirilmoqda va BROKER PAID yozilmoqda... 80%")
+        except Exception:
+            pass
+        updated, skipped, not_found, results = sheet_service.update_broker_payment_across_sheets(
+            sheet_names, parsed_data, company=company
+        )
 
-    def _process_broker_sync():
-        """Og'ir ishni alohida threadda — event loop bloklanmaydi."""
-        grouped = {}
-        no_date_items = []
-
-        for item in parsed_data:
-            load_num = item.get('load_number', '') or ''
-            if not str(load_num).strip():
-                continue
-            date_obj = item.get('date')
-            if date_obj:
-                sheet_name = sheet_service.get_sheet_by_date(date_obj, sheet_names=all_sheet_names, company=company)
-                if sheet_name:
-                    if sheet_name not in grouped:
-                        grouped[sheet_name] = []
-                    grouped[sheet_name].append(item)
-                else:
-                    no_date_items.append(item)
-            else:
-                no_date_items.append(item)
-
-        logger.info("Broker: %d ta sheet, %d ta no-date", len(grouped), len(no_date_items))
-
-        # No-date: barcha sheet map'larni 1 marta parallel olish (tez batch)
-        sheet_load_map_cache = {}
-        if no_date_items:
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                maps = pool.map(
-                    lambda sn: (sn, sheet_service.get_load_to_row_map(sn, company=company)),
-                    date_sheet_names
-                )
-                sheet_load_map_cache = dict(maps)
-
-        for item in no_date_items[:]:
-            target = sheet_service._normalize_load_num(item.get('load_number', ''))
-            if not target:
-                continue
-            for sn in date_sheet_names:
-                load_map = sheet_load_map_cache.get(sn, {})
-                if target in load_map:
-                    if sn not in grouped:
-                        grouped[sn] = []
-                    grouped[sn].append(item)
-                    no_date_items.remove(item)
-                    break
-
-        all_results = []
-        total_updated = 0
-        total_skipped = 0
-        total_not_found = 0
-
-        # Factoring/Fuel/Toll kabi tez: sheetlarni parallel batch qayta ishlash (max 4 ta bir vaqtda)
-        def _update_one_sheet(sn_items):
-            sn, items = sn_items
-            return sheet_service.update_broker_payment_batch(sn, items, company=company)
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            batch_results = list(pool.map(_update_one_sheet, grouped.items()))
-
-        for u, s, nf, res in batch_results:
-            total_updated += u
-            total_skipped += s
-            total_not_found += nf
-            all_results.extend(res)
-
-        for item in no_date_items:
-            total_not_found += 1
-            amt = item.get("invoice_amount") if item.get("invoice_amount") is not None else item.get("amount")
-            all_results.append({
-                "Load #": item.get("load_number"),
-                "Invoice Amount": amt,
-                "Broker Amount": amt,
-                "Date": item.get("date"),
-                "Status": "LOAD NOT FOUND"
-            })
-
-        result_df = pd.DataFrame(all_results)
+        result_df = pd.DataFrame(results)
         import tempfile
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
         report_filename = tmp.name
@@ -300,7 +174,7 @@ async def handle_broker_document(message: types.Message):
             ws_rep = wb.active
             status_col = None
             for c in range(1, ws_rep.max_column + 1):
-                if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
+                if str(ws_rep.cell(row=1, column=c).value or "").strip() == "Status":
                     status_col = c
                     break
             if status_col:
@@ -310,9 +184,9 @@ async def handle_broker_document(message: types.Message):
                 for r in range(2, ws_rep.max_row + 1):
                     cell = ws_rep.cell(row=r, column=status_col)
                     v = str(cell.value or "").upper()
-                    if "UPDATED" in v or ("FOUND" in v and "NOT FOUND" not in v):
+                    if "FOUND" in v and "NOT FOUND" not in v:
                         cell.fill = green_fill
-                    elif "SKIPPED" in v or "ALREADY FILLED" in v:
+                    elif "ALREADY FILLED" in v:
                         cell.fill = yellow_fill
                     elif "NOT FOUND" in v or "EMPTY" in v or "PROTECTED" in v:
                         cell.fill = red_fill
@@ -320,31 +194,25 @@ async def handle_broker_document(message: types.Message):
         except Exception:
             pass
 
-        return report_filename, total_updated, total_skipped, total_not_found
-
-    try:
-        report_filename, total_updated, total_skipped, total_not_found = await asyncio.to_thread(_process_broker_sync)
+        sheet_list = ", ".join(sheet_names[:5]) + (" ..." if len(sheet_names) > 5 else "")
+        await message.answer(
+            f"✅ Broker Payments yakunlandi (oxirgi 10 hafta: {sheet_list})\n\n"
+            f"Yangilandi: {updated}\nO'tkazib yuborildi: {skipped}\nTopilmadi: {not_found}",
+            reply_markup=broker_menu
+        )
+        await message.answer_document(types.FSInputFile(report_filename))
+        os.remove(report_filename)
+        try:
+            await progress_msg.edit_text("✅ Broker Payments yakunlandi... 100%")
+        except Exception:
+            pass
     except GspreadAPIError as e:
         if "429" in str(e):
             await message.answer("⚠️ Google Sheets limiti tugadi. 1-2 daqiqa kutib qayta yuboring.")
         else:
             await message.answer(f"Sheet xatolik: {e}")
-        logger.exception("Broker: Gspread xatosi")
         return
     except Exception as e:
-        logger.exception("Broker: processing xatosi")
-        await message.answer(f"❌ Xatolik: {e}\n\nTerminalda logni tekshiring.")
+        logger.exception("Broker: sheet init xatosi")
+        await message.answer(f"Xatolik: {e}")
         return
-
-    try:
-        await message.answer(
-            f"✅ Broker Payments yakunlandi.\n\n"
-            f"Yangilandi: {total_updated}\nO'tkazib yuborildi: {total_skipped}\nTopilmadi: {total_not_found}",
-            reply_markup=broker_menu
-        )
-        await message.answer_document(types.FSInputFile(report_filename))
-    except Exception as e:
-        await message.answer(f"❌ Xatolik yuz berdi: {e}\n\nTerminalda logni tekshiring.")
-    finally:
-        if os.path.exists(report_filename):
-            os.remove(report_filename)

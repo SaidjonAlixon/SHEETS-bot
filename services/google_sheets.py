@@ -53,7 +53,7 @@ class GoogleSheetService:
                     break
                 except GspreadAPIError as e:
                     if "429" in str(e) and attempt < 3:
-                        time.sleep(30 * (attempt + 1))
+                        time.sleep(1.5 * (attempt + 1))
                     else:
                         raise
         return self._load_spreadsheets.get(company)
@@ -71,19 +71,19 @@ class GoogleSheetService:
                     break
                 except GspreadAPIError as e:
                     if "429" in str(e) and attempt < 3:
-                        time.sleep(30 * (attempt + 1))
+                        time.sleep(1.5 * (attempt + 1))
                     else:
                         raise
         return self._expenses_spreadsheets.get(company)
 
-    def _retry_on_429(self, func, *args, max_retries=4, **kwargs):
-        """429 da avtomatik retry."""
+    def _retry_on_429(self, func, *args, max_retries=2, **kwargs):
+        """429 da avtomatik retry (tezroq backoff)."""
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
             except GspreadAPIError as e:
                 if "429" in str(e) and attempt < max_retries - 1:
-                    wait = 20 + attempt * 25
+                    wait = 0.8 * (attempt + 1)
                     time.sleep(wait)
                     continue
                 raise
@@ -192,6 +192,10 @@ class GoogleSheetService:
             except Exception:
                 pass
 
+        # Probel va separatorlarni olib tashlaymiz: "TR-0001 23" == "TR000123"
+        s = re.sub(r'[\s\-_/#]+', '', s)
+        s = s.upper()
+
         # Agar oxiri .0 bo'lsa (masalan '7083...0' yoki '123.0')
         if s.endswith(".0"):
             return s[:-2]
@@ -269,6 +273,29 @@ class GoogleSheetService:
         sorted_names = sorted(names, key=_sort_key, reverse=True)
         return sorted_names[:n]
 
+    def _get_columns_from_start(self, sheet, cols, start_row=17):
+        """
+        Bir nechta ustunni bitta API chaqiruv bilan o'qiydi.
+        Qaytaradi: {col_num: [values...]} (start_row dan boshlab).
+        """
+        col_letters = {}
+        for col in cols:
+            # 1 -> A, 26 -> Z
+            q = col
+            letters = ""
+            while q > 0:
+                q, r = divmod(q - 1, 26)
+                letters = chr(65 + r) + letters
+            col_letters[col] = letters
+        ranges = [f"{col_letters[col]}{start_row}:{col_letters[col]}" for col in cols]
+        data = self._retry_on_429(sheet.batch_get, ranges)
+        result = {}
+        for idx, col in enumerate(cols):
+            vals_2d = data[idx] if idx < len(data) else []
+            # [["v1"], ["v2"]] -> ["v1","v2"]
+            result[col] = [row[0] if row else "" for row in vals_2d]
+        return result
+
     def update_factoring_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
         """
         Bir nechta sheetda Load # ni qidirib, topilganiga summani yozadi.
@@ -279,32 +306,44 @@ class GoogleSheetService:
             return (0, 0, len(parsed_data), [])
 
         load_to_sheet_row = {}  # normalized_load -> (sheet_name, row_num, inv_cur_value)
+        sheet_cache = {}
         for sn in sheet_names:
             sheet = self.get_load_board(sn, company)
             if not sheet:
                 continue
+            sheet_cache[sn] = sheet
             try:
-                all_rows = self._retry_on_429(sheet.get_all_values)
+                needed_cols = sorted(set(load_cols) | {16})
+                col_map = self._get_columns_from_start(sheet, needed_cols, start_row=start_row)
+                max_len = max((len(v) for v in col_map.values()), default=0)
             except Exception:
                 continue
-            for i in range(start_row - 1, len(all_rows)):
-                row = all_rows[i] if i < len(all_rows) else []
+            for row_num in range(start_row, start_row + max_len):
                 for col in load_cols:
-                    val = row[col - 1] if len(row) >= col else ""
+                    vals = col_map.get(col, [])
+                    idx = row_num - start_row
+                    val = vals[idx] if idx < len(vals) else ""
                     norm = self._normalize_load_num(val)
                     if norm and norm not in load_to_sheet_row:
-                        inv_cur = row[15] if len(row) > 15 else ""  # P ustuni = 16, index 15
-                        load_to_sheet_row[norm] = (sn, i + 1, inv_cur)
+                        inv_vals = col_map.get(16, [])
+                        inv_cur = inv_vals[idx] if idx < len(inv_vals) else ""
+                        load_to_sheet_row[norm] = (sn, row_num, inv_cur)
                         break
+
+        # Bir xil load bir necha marta kelsa, oxirgi amountni olamiz (tezlik uchun).
+        aggregated = {}
+        for item in parsed_data:
+            ln = self._normalize_load_num(item.get("load_number", "") or "")
+            if ln:
+                aggregated[ln] = item
 
         results = []
         cells_by_sheet = {}
-        pending_by_sheet = {}
         updated = 0
         skipped = 0
         not_found = 0
 
-        for item in parsed_data:
+        for item in aggregated.values():
             load_num = item.get("load_number", "") or ""
             amount = item.get("amount") or 0
             if not str(load_num).strip():
@@ -331,7 +370,7 @@ class GoogleSheetService:
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "SKIPPED"})
 
         for sn, cells in cells_by_sheet.items():
-            ws = self.get_load_board(sn, company)
+            ws = sheet_cache.get(sn) or self.get_load_board(sn, company)
             if ws and cells:
                 self._retry_on_429(ws.update_cells, cells)
 
@@ -339,30 +378,51 @@ class GoogleSheetService:
 
     def update_broker_payment_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
         """
-        Oxirgi 10 hafta sheetlarida Load # ni qidirib, Funded Amount ni R (BROKER PAID) ga yozadi.
+        Oxirgi 10 hafta sheetlarida Load # ni qidirib, R (BROKER PAID) ga yozadi.
+        Tezlik uchun faqat BROKER PAID (R) yangilanadi; STATUS alohida yozilmaydi.
         parsed_data: [{'load_number': '...', 'amount': summa}, ...] — bitta load uchun bitta, umumiy summa.
         """
         if not sheet_names or not parsed_data:
             return (0, 0, len(parsed_data) if parsed_data else 0, [])
 
         load_to_sheet_row = {}
+        sheet_cache = {}
+
+        # Eng barqaror usul: ketma-ket scan + batch_get (thread ishlatmaymiz).
         for sn in sheet_names:
             sheet = self.get_load_board(sn, company)
             if not sheet:
                 continue
+            sheet_cache[sn] = sheet
             try:
-                all_rows = self._retry_on_429(sheet.get_all_values)
+                needed_cols = sorted(set(load_cols) | {18})
+                col_map = self._get_columns_from_start(sheet, needed_cols, start_row=start_row)
+                max_len = max((len(v) for v in col_map.values()), default=0)
             except Exception:
                 continue
-            for i in range(start_row - 1, len(all_rows)):
-                row = all_rows[i] if i < len(all_rows) else []
+
+            for row_num in range(start_row, start_row + max_len):
+                idx = row_num - start_row
                 for col in load_cols:
-                    val = row[col - 1] if len(row) >= col else ""
+                    vals = col_map.get(col, [])
+                    val = vals[idx] if idx < len(vals) else ""
                     norm = self._normalize_load_num(val)
                     if norm and norm not in load_to_sheet_row:
-                        paid_cur = row[17] if len(row) > 17 else ""
-                        load_to_sheet_row[norm] = (sn, i + 1, paid_cur)
+                        paid_vals = col_map.get(18, [])
+                        paid_cur = paid_vals[idx] if idx < len(paid_vals) else ""
+                        load_to_sheet_row[norm] = (sn, row_num, paid_cur)
                         break
+
+        # Bir xil load bir necha marta kelsa amountlarni yig'amiz.
+        aggregated = {}
+        for item in parsed_data:
+            raw_load = item.get("load_number", "") or ""
+            target = self._normalize_load_num(raw_load)
+            if not target:
+                continue
+            if target not in aggregated:
+                aggregated[target] = {"load_number": raw_load, "amount": 0}
+            aggregated[target]["amount"] += (item.get("amount") or 0)
 
         results = []
         cells_by_sheet = {}
@@ -371,7 +431,7 @@ class GoogleSheetService:
         skipped = 0
         not_found = 0
 
-        for item in parsed_data:
+        for item in aggregated.values():
             load_num = item.get("load_number", "") or ""
             amount = item.get("amount") or 0
             if not str(load_num).strip():
@@ -392,7 +452,6 @@ class GoogleSheetService:
                 if sheet_name not in pending_by_sheet:
                     pending_by_sheet[sheet_name] = []
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=18, value=amount))
-                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Broker paid"))
                 updated += 1
                 results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "FOUND"})
                 pending_by_sheet[sheet_name].append((len(results) - 1, row_num, amount))
@@ -401,26 +460,19 @@ class GoogleSheetService:
                 results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "ALREADY FILLED"})
 
         for sn, cells in cells_by_sheet.items():
-            ws = self.get_load_board(sn, company)
+            ws = sheet_cache.get(sn) or self.get_load_board(sn, company)
             if ws and cells:
                 try:
                     self._retry_on_429(ws.update_cells, cells)
                 except Exception as e:
                     err = str(e).lower()
-                    # Protected range bo'lsa batch yiqiladi; qatorma-qator tekshirib reportga status qo'yamiz.
+                    # Protected range bo'lsa batch yiqiladi.
+                    # Tezlik uchun qatorma-qator qayta yozishga urinmaymiz, reportga belgilaymiz.
                     if "protected" in err:
-                        for result_idx, row_num, amount in pending_by_sheet.get(sn, []):
-                            try:
-                                self._retry_on_429(ws.update_cell, row_num, 18, amount)
-                                self._retry_on_429(ws.update_cell, row_num, 15, "Broker paid")
-                            except Exception as row_e:
-                                row_err = str(row_e).lower()
-                                if "protected" in row_err:
-                                    results[result_idx]["Status"] = "PROTECTED CELL"
-                                else:
-                                    results[result_idx]["Status"] = "ERROR"
-                                updated = max(0, updated - 1)
-                                skipped += 1
+                        for result_idx, _, _ in pending_by_sheet.get(sn, []):
+                            results[result_idx]["Status"] = "PROTECTED CELL"
+                        skipped += len(pending_by_sheet.get(sn, []))
+                        updated = max(0, updated - len(pending_by_sheet.get(sn, [])))
                     else:
                         for result_idx, _, _ in pending_by_sheet.get(sn, []):
                             results[result_idx]["Status"] = "ERROR"
