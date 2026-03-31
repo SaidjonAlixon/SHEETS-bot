@@ -18,16 +18,12 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         base.append([KeyboardButton(text="⚙️ Sozlamalar")])
     return ReplyKeyboardMarkup(keyboard=base, resize_keyboard=True)
 
-# Foydalanuvchilar uchun faqat BUTATA, adminlar uchun barcha kompaniyalar
 def get_load_select_menu(user_id: int) -> ReplyKeyboardMarkup:
-    if is_admin(user_id):
-        keyboard = [
-            [KeyboardButton(text="DELO"), KeyboardButton(text="MNK")],
-            [KeyboardButton(text="BUTATA"), KeyboardButton(text="AKA FS")],
-            [KeyboardButton(text="NYBC LLC")],
-        ]
-    else:
-        keyboard = [[KeyboardButton(text="BUTATA")]]
+    keyboard = [
+        [KeyboardButton(text="DELO"), KeyboardButton(text="MNK")],
+        [KeyboardButton(text="BUTATA"), KeyboardButton(text="AKA FS")],
+        [KeyboardButton(text="NYBC LLC")],
+    ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 # Oddiy menyu (get_main_menu ishlatiladi)
