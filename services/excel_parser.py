@@ -74,7 +74,7 @@ class ExcelParser:
     def parse_factoring_report(file_content):
         """
         Factoring Payments fayli.
-        Qo'llab-quvvatlanadi: Load/PO # (D), Load Number; faqat Funded Amount (H).
+        Load: Load/PO # (D yoki nom bo'yicha); summa: Invoice Amount (E yoki nom bo'yicha).
         Qaytaradi: [{'load_number': '...', 'amount': ...}, ...]
         """
         try:
@@ -84,20 +84,20 @@ class ExcelParser:
                 df = pd.read_csv(io.BytesIO(file_content), encoding='utf-8', encoding_errors='ignore')
             df.columns = [str(c).strip() for c in df.columns]
             load_col = None
-            funded_col = None
+            invoice_col = None
             for i, col in enumerate(df.columns):
                 col_lower = str(col).lower()
                 # Load: Load/PO #, Load Number, Load # va hokazo
                 if 'load' in col_lower and ('po' in col_lower or '#' in col_lower or 'number' in col_lower or i == 3):
                     load_col = col
-                # Factoring uchun ustuvor: Funded Amount (H)
-                elif 'funded amount' in col_lower or ('funded' in col_lower and 'amount' in col_lower):
-                    funded_col = col
+                # Factoring: Invoice Amount (Excel E)
+                elif 'invoice' in col_lower and 'amount' in col_lower:
+                    invoice_col = col
             if load_col is None and len(df.columns) > 1:
                 load_col = df.columns[1]  # B - odatda Load Number
-            if funded_col is None and len(df.columns) > 7:
-                funded_col = df.columns[7]  # H - odatda Funded Amount
-            if load_col is None or funded_col is None:
+            if invoice_col is None and len(df.columns) > 4:
+                invoice_col = df.columns[4]  # E - Invoice Amount
+            if load_col is None or invoice_col is None:
                 return []
             results = []
             for _, row in df.iterrows():
@@ -105,7 +105,7 @@ class ExcelParser:
                 if pd.isna(load_num) or not str(load_num).strip() or str(load_num).strip().lower() == 'nan':
                     continue
                 load_str = str(load_num).strip()
-                inv_val = row.get(funded_col)
+                inv_val = row.get(invoice_col)
                 amount_val = 0.0
                 if pd.notna(inv_val):
                     s = str(inv_val).strip().replace(',', '.')

@@ -223,7 +223,7 @@ async def callback_report_sheet(callback: types.CallbackQuery):
 @dp.message(F.text == "📤 Fayl yuklash (Excel xlsx/xls)", BotStates.Factoring)
 async def ask_file(message: types.Message):
     await message.answer("Iltimos, Factoring Payments faylini (Excel xlsx, xls) yuboring.\n"
-                         "Faylda Load/PO # va Funded Amount (H) ustunlari bo'lishi kerak.")
+                         "Faylda Load/PO # va Invoice Amount (E) ustunlari bo'lishi kerak.")
 
 @dp.message(F.document, BotStates.Factoring)
 async def handle_factoring_document(message: types.Message, state: FSMContext):
@@ -250,7 +250,7 @@ async def handle_factoring_document(message: types.Message, state: FSMContext):
         parsed_data = ExcelParser.parse_invoice(content_bytes)
 
     if not parsed_data:
-        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. D (Load/PO #) va H (Funded Amount) ustunlarini tekshiring.")
+        await message.answer("Fayldan ma'lumot o'qib bo'lmadi. Load # va E (Invoice Amount) ustunlarini tekshiring.")
         return
 
     await _process_factoring_auto(parsed_data, file_name, state, message.chat.id, company)
