@@ -173,6 +173,7 @@ def match_toll_named_columns(df) -> tuple[str, str, str] | None:
 
 def parse_toll_posting_date(val):
     """PostingDate (masalan DD.MM.YYYY) -> date yoki None."""
+    import re
     from datetime import datetime
 
     import pandas as pd
@@ -181,15 +182,33 @@ def parse_toll_posting_date(val):
         return None
     if pd.isna(val):
         return None
+    if isinstance(val, pd.Timestamp):
+        return val.date()
     if isinstance(val, datetime):
         return val.date()
     s = str(val).strip()
     if not s or s.lower() == "nan":
         return None
-    # Excel serial (taxminiy)
+    if "T" in s:
+        s = s.split("T", 1)[0].strip()
+    elif " " in s and re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        s = s.split()[0]
+    elif " " in s and re.match(r"^\d{1,2}\.\d{1,2}\.\d{4}", s):
+        s = s.split()[0]
+    # Excel serial (raqam yoki "45452" qatori)
     try:
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             v = float(val)
+            if 30000 < v < 60000:
+                from datetime import date, timedelta
+
+                base = date(1899, 12, 30)
+                return base + timedelta(days=int(v))
+    except Exception:
+        pass
+    try:
+        if re.match(r"^\d+\.?\d*$", s):
+            v = float(s)
             if 30000 < v < 60000:
                 from datetime import date, timedelta
 
@@ -206,6 +225,38 @@ def parse_toll_posting_date(val):
         return pd.to_datetime(val, dayfirst=True).date()
     except Exception:
         return None
+
+
+def expense_item_date_in_segment(item_date, seg_start, seg_end) -> bool:
+    """
+    Exceldagi tranzaksiya sanasi (yil farq qilishi mumkin) sheetdagi hafta oralig'iga tushadimi.
+    Masalan: sheet "2024 ... 03.30-04.05", Excelda 01.04.2026 — oy-kun segment yiliga
+    moslashtirilib tekshiriladi (mart-aprel oralig'idagi aprel kunlari ham kiradi).
+    """
+    from datetime import date as date_cls
+
+    years_to_try = {seg_start.year, seg_end.year, item_date.year}
+    years_to_try.add(seg_start.year - 1)
+    years_to_try.add(seg_end.year + 1)
+
+    for y in sorted(years_to_try):
+        try:
+            d = date_cls(y, item_date.month, item_date.day)
+        except ValueError:
+            if item_date.month == 2 and item_date.day == 29:
+                try:
+                    d = date_cls(y, 2, 28)
+                except ValueError:
+                    continue
+            else:
+                continue
+        if seg_start <= seg_end:
+            if seg_start <= d <= seg_end:
+                return True
+        else:
+            if d >= seg_start or d <= seg_end:
+                return True
+    return False
 
 
 def parse_toll_amount_positive_only(val):
@@ -1054,18 +1105,9 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         fuel_sum = float(item.get("fuel", 0.0) or 0.0)
         discount_sum = float(item.get("discount", 0.0) or 0.0)
 
-        item_md = (item_date.month, item_date.day)
         assigned = False
         for i, seg in enumerate(segments):
-            start_md = (seg["start_date"].month, seg["start_date"].day)
-            end_md = (seg["end_date"].month, seg["end_date"].day)
-            if start_md <= end_md:
-                ok = start_md <= item_md <= end_md
-            else:
-                # year wrap: masalan 12.28-01.05
-                ok = item_md >= start_md or item_md <= end_md
-
-            if not ok:
+            if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
                 continue
 
             if card not in card_totals_by_seg[i]:
@@ -1215,25 +1257,15 @@ async def callback_fuel_range(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...")
 
-    # Filter faqat shu oralig'idagi yozuvlar.
-    # Yil noto'g'ri chiqsa ham muammo bo'lmasligi uchun month/day bo'yicha taqqoslaymiz.
+    # Filter faqat shu oralig'idagi yozuvlar (sheet yili bilan oy-kun moslashtiriladi).
     card_totals = {}
-    start_md = (seg["start_date"].month, seg["start_date"].day)
-    end_md = (seg["end_date"].month, seg["end_date"].day)
-
-    def in_range_md(d):
-        md = (d.month, d.day)
-        if start_md <= end_md:
-            return start_md <= md <= end_md
-        # Year wrap (masalan 12.28-01.05)
-        return md >= start_md or md <= end_md
 
     for item in fuel_entries:
         try:
             item_date = datetime.fromisoformat(item["date"]).date()
         except Exception:
             continue
-        if not in_range_md(item_date):
+        if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
             continue
         card = str(item.get("card", "")).strip()
         if not card:
@@ -1453,20 +1485,14 @@ async def callback_toll_sheet(callback: types.CallbackQuery, state: FSMContext):
         if not transponder:
             continue
         toll_sum = float(item.get("toll", 0.0) or 0.0)
-        item_md = (item_date.month, item_date.day)
         for i, seg in enumerate(segments):
-            start_md = (seg["start_date"].month, seg["start_date"].day)
-            end_md = (seg["end_date"].month, seg["end_date"].day)
-            if start_md <= end_md:
-                ok = start_md <= item_md <= end_md
-            else:
-                ok = item_md >= start_md or item_md <= end_md
-            if ok:
-                if transponder not in transponder_totals_by_seg[i]:
-                    transponder_totals_by_seg[i][transponder] = 0.0
-                transponder_totals_by_seg[i][transponder] += toll_sum
-                matched += 1
-                break
+            if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
+                continue
+            if transponder not in transponder_totals_by_seg[i]:
+                transponder_totals_by_seg[i][transponder] = 0.0
+            transponder_totals_by_seg[i][transponder] += toll_sum
+            matched += 1
+            break
 
     if matched == 0:
         await callback.message.edit_text("❌ Mos hafta topilmadi. Faylni tekshiring.")
