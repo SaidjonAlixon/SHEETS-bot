@@ -7,6 +7,283 @@ from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from states.bot_states import BotStates
 from utils.company_storage import get_company
 
+
+def _fuel_norm_header(val) -> str:
+    import re
+    import pandas as pd
+    if val is None or (isinstance(val, float) and val != val):
+        return ""
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    s = s.replace("\ufeff", "").replace("\xa0", " ")
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _flatten_column_name(col) -> str:
+    """MultiIndex yoki tuple ustun nomlarini bitta qatorga."""
+    if isinstance(col, tuple):
+        parts = [str(p) for p in col if p is not None and str(p) != "nan" and str(p).strip()]
+        return " ".join(parts)
+    return str(col)
+
+
+def match_fuel_four_columns(headers: list[str]) -> tuple[int, int, int, int] | None:
+    """
+    Normalizatsiyalangan sarlavha ro'yxatidan ustun indekslari: card, date, disc, amt.
+    """
+    n = len(headers)
+    if n < 4:
+        return None
+    card_col = date_col = disc_col = amt_col = None
+    for j, h in enumerate(headers):
+        if not h:
+            continue
+        if card_col is None and "card" in h:
+            card_col = j
+        if date_col is None:
+            if ("tran" in h or "trans" in h) and "date" in h:
+                date_col = j
+            elif h in ("transaction date", "post date") and "toll" not in h:
+                date_col = j
+        if disc_col is None:
+            if (
+                "disc" in h
+                and "amt" in h
+                and "ppu" not in h
+                and "cost" not in h
+                and "type" not in h
+            ):
+                disc_col = j
+        if amt_col is None:
+            if h == "amt" or (h == "amount" and "disc" not in h):
+                amt_col = j
+            elif (
+                h.endswith(" amt")
+                and "disc" not in h
+                and "ppu" not in h
+                and h not in ("disc amt",)
+            ):
+                amt_col = j
+    if date_col is None:
+        for j, h in enumerate(headers):
+            if h == "date":
+                date_col = j
+                break
+    if amt_col is None:
+        for j, h in enumerate(headers):
+            if h in ("net amt", "fuel amt", "total amt", "total") and "disc" not in h:
+                amt_col = j
+                break
+    if (
+        card_col is not None
+        and date_col is not None
+        and disc_col is not None
+        and amt_col is not None
+        and len({card_col, date_col, disc_col, amt_col}) == 4
+    ):
+        return card_col, date_col, disc_col, amt_col
+    return None
+
+
+def find_fuel_transaction_header_map(df) -> tuple[int, int, int, int, int] | None:
+    """
+    Excel jadvalida (header=None) ustun nomlari qatorini qidiradi.
+    Qaytaradi: (header_row_index, card_col, date_col, disc_col, amt_col) yoki None.
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return None
+    ncols = int(df.shape[1])
+    if ncols < 4:
+        return None
+    max_hr = min(45, len(df))
+    for hr in range(max_hr):
+        headers = [_fuel_norm_header(df.iloc[hr, j]) for j in range(ncols)]
+        m = match_fuel_four_columns(headers)
+        if m:
+            ci, di, qi, ai = m
+            return hr, ci, di, qi, ai
+    return None
+
+
+def find_fuel_columns_from_named_dataframe(df) -> tuple[int, int, int, int] | None:
+    """pd.read_excel(header=0) — ustun nomlari Card #, Tran Date, ... bo'lsa."""
+    if df is None or df.empty:
+        return None
+    headers = []
+    for c in df.columns:
+        headers.append(_fuel_norm_header(_flatten_column_name(c)))
+    return match_fuel_four_columns(headers)
+
+
+def autopick_fuel_expense_tab(sheet_candidates: list, fuel_entries: list) -> str | None:
+    """Barcha tranzaksiya sanalari bitta hafta-list oralig'iga tushsa, o'sha list nomini qaytaradi."""
+    import re
+    from datetime import datetime, date
+    if not sheet_candidates or not fuel_entries:
+        return None
+    dates: list = []
+    for e in fuel_entries:
+        try:
+            dates.append(datetime.fromisoformat(e["date"]).date())
+        except Exception:
+            continue
+    if not dates:
+        return None
+    min_d, max_d = min(dates), max(dates)
+    range_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
+    fits: list[str] = []
+    for name in sheet_candidates:
+        m = range_re.search(name)
+        if not m:
+            continue
+        year_m = re.search(r"(\d{4})", name)
+        year = int(year_m.group(1)) if year_m else date.today().year
+        start_str, end_str = m.group(1), m.group(2)
+        sm, sd = map(int, start_str.split("."))
+        em, ed = map(int, end_str.split("."))
+        start_date = date(year, sm, sd)
+        end_year = year
+        if (em, ed) < (sm, sd):
+            end_year = year + 1
+        end_date = date(end_year, em, ed)
+        if start_date <= min_d and max_d <= end_date:
+            fits.append(name)
+    if len(fits) == 1:
+        return fits[0]
+    return None
+
+
+async def apply_fuel_named_week_to_sheet(
+    status_msg,
+    state: FSMContext,
+    company: str,
+    sheet_name: str,
+    fuel_entries: list,
+    fuel_filename: str,
+) -> bool:
+    """
+    Google Sheet varag'i nomida MM.DD-MM.DD oralig'i bo'lsa — yozuv + Excel hisobot.
+    False: bu varaq uslubida ishlamaydi (keyingi filialga o'ting).
+    """
+    import os
+    import re
+    import tempfile
+    import pandas as pd
+    from datetime import datetime, date
+    from aiogram.types import FSInputFile
+    from services.google_sheets import get_sheet_service
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill
+
+    range_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
+    year_m = re.search(r"(\d{4})", sheet_name)
+    year = int(year_m.group(1)) if year_m else datetime.now().year
+    m = range_re.search(sheet_name)
+    if not m:
+        return False
+
+    start_str, end_str = m.group(1), m.group(2)
+    start_month, start_day = map(int, start_str.split("."))
+    end_month, end_day = map(int, end_str.split("."))
+    start_date = date(year, start_month, start_day)
+    end_year = year
+    if (end_month, end_day) < (start_month, start_day):
+        end_year = year + 1
+    end_date = date(end_year, end_month, end_day)
+
+    sheet_service = get_sheet_service()
+    card_totals = {}
+    for item in fuel_entries:
+        try:
+            item_date = datetime.fromisoformat(item["date"]).date()
+        except Exception:
+            continue
+        if not (start_date <= item_date <= end_date):
+            continue
+        card = str(item.get("card", "")).strip()
+        if not card:
+            continue
+        fuel_sum = float(item.get("fuel", 0.0) or 0.0)
+        discount_sum = float(item.get("discount", 0.0) or 0.0)
+        if card not in card_totals:
+            card_totals[card] = [0.0, 0.0]
+        card_totals[card][0] += fuel_sum
+        card_totals[card][1] += discount_sum
+
+    if not card_totals:
+        await status_msg.edit_text(f"List <b>{sheet_name}</b> oralig'ida mos yozuv topilmadi.")
+        await state.set_state(BotStates.Fuel)
+        return True
+
+    card_totals_tuple = {k: (v[0], v[1]) for k, v in card_totals.items()}
+    updated, skipped, missing_count, missing_cards = sheet_service.update_fuel_toll_expenses(
+        sheet_name,
+        card_totals_tuple,
+        fuel_col=5,
+        discount_col=6,
+        company=company,
+    )
+
+    report_rows = []
+    missing_set = set(str(x) for x in (missing_cards or []))
+    week_label = f"{start_str}-{end_str}"
+    for card, (fuel_sum, discount_sum) in card_totals_tuple.items():
+        card_s = str(card)
+        if (fuel_sum or 0) == 0 and (discount_sum or 0) == 0:
+            continue
+        status = "TOPILMADI" if card_s in missing_set else "TOPILDI"
+        report_rows.append(
+            {
+                "Sheet": sheet_name,
+                "Week": week_label,
+                "Card": card_s,
+                "FuelSum": fuel_sum,
+                "DiscountSum": discount_sum,
+                "Status": status,
+            }
+        )
+
+    try:
+        report_df = pd.DataFrame(report_rows)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        tmp_path = tmp.name
+        tmp.close()
+        report_df.to_excel(tmp_path, index=False)
+        try:
+            wb = load_workbook(tmp_path)
+            ws_rep = wb.active
+            status_col_idx = None
+            for c in range(1, ws_rep.max_column + 1):
+                if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
+                    status_col_idx = c
+                    break
+            if status_col_idx:
+                green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                for r in range(2, ws_rep.max_row + 1):
+                    cell = ws_rep.cell(row=r, column=status_col_idx)
+                    v = str(cell.value).strip().upper() if cell.value is not None else ""
+                    if v == "TOPILDI":
+                        cell.fill = green_fill
+                    elif v == "TOPILMADI":
+                        cell.fill = red_fill
+                wb.save(tmp_path)
+        except Exception:
+            pass
+        await status_msg.answer_document(FSInputFile(tmp_path))
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    await status_msg.edit_text("✅ Fuel yozildi. (Excel report yuborildi)")
+    await state.set_state(BotStates.Fuel)
+    return True
+
+
 @dp.message(F.text == "⛽ Fuel Expenses")
 async def enter_fuel(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
@@ -14,7 +291,11 @@ async def enter_fuel(message: types.Message, state: FSMContext):
         await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Fuel)
-    await message.answer("Iltimos, Excel (xlsx, xls) fayl yuboring.", reply_markup=expenses_menu)
+    await message.answer(
+        "Excel (xlsx, xls) yuboring. Jadvalda <b>Card #</b>, <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> "
+        "sarlavhalari bo'lsa — bot ustunlarni o'zi topadi; hafta ro'yxati aniq bo'lsa, Google Sheetga avtomatik yozadi.",
+        reply_markup=expenses_menu,
+    )
 
 @dp.message(F.text == "🛣️ Toll Expenses")
 async def enter_toll(message: types.Message, state: FSMContext):
@@ -73,23 +354,8 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
 
         # -------------------- FUEL --------------------
         if expense_type == "FUEL":
-            # A = Card (sheets C4 dan boshlab)
-            # B = Trans Date (shu sanaga mos list tanlash uchun)
-            # S = Fuel summasi -> Fuel after discount
-            # Q = Disc Amt -> Discount ustuniga (Toll Exp emas)
-            # 1 fayl ichida bir xil card bir necha bor chiqsa: tanlangan list doirasida hammasini jamlaymiz.
-
-            try:
-                # Card id (A ustun) uzun bo'lgani uchun uni string sifatida o'qish kerak
-                df = pd.read_excel(io.BytesIO(content_bytes), dtype=str)
-            except Exception:
-                await message.answer("❌ Fuel uchun xlsx faylni o‘qib bo‘lmadi.")
-                return
-
-            # Indekslar (0-based): A=0, B=1, Q=16, S=18
-            if df.shape[1] <= 18:
-                await message.answer("❌ Fuel xlsx faylda kamida 19 ta ustun bo‘lishi kerak (Q va S indekslar uchun).")
-                return
+            # Ustunlar sarlavha bo'yicha topiladi: Card #, Tran Date, Disc Amt, Amt (tartib ixtiyoriy).
+            # Bir nechta varaq bo'lsa, birinchisi bo'yicha ma'lumot chiqadigan varaq tanlanadi.
 
             def parse_money(val):
                 if val is None or (isinstance(val, float) and val != val):
@@ -110,13 +376,6 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 except ValueError:
                     return 0.0
 
-            # Parse: card + date -> fuel/discount summa
-            # S = Fuel Amount, Q = Disc Amt -> Discount ustuniga yoziladi (Toll Exp emas)
-            entries_acc = {}  # (card, date_iso) -> [fuel_sum, discount_sum]
-            progress_step = max(1, int(len(df) / 20))
-            processed = 0
-            last_progress = await message.answer("⏳ Fuel xlsx o‘qilmoqda... 0%")
-
             def normalize_card_str(v: str) -> str:
                 if v is None:
                     return ""
@@ -135,38 +394,129 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     return s[:-2]
                 return s
 
-            for _, row in df.iterrows():
-                card_val = normalize_card_str(row.iloc[0])
-                date_val = row.iloc[1]
-                q_val = row.iloc[16]  # Q = Disc Amt
-                s_val = row.iloc[18]  # S = Fuel Amount
+            def parse_fuel_tran_date(val):
+                """
+                EFS/Transaction report: B ustun — odatda DD.MM.YYYY (Yevropa).
+                pd.to_datetime() defaultda 01.04.2026 ni AQSH sifatida (4-yanvar) o'qiydi — noto'g'ri.
+                Excel ba'zan sanani serial raqam (float) qilib beradi.
+                """
+                import datetime as dt_mod
 
-                if not card_val:
-                    continue
-                try:
-                    trans_date = pd.to_datetime(date_val).date()
-                except Exception:
-                    continue
-
-                card_str = card_val
-                date_iso = trans_date.isoformat()
-
-                discount_sum = parse_money(q_val)  # Disc Amt -> Discount ustuniga
-                fuel_sum = parse_money(s_val)
-
-                key = (card_str, date_iso)
-                if key not in entries_acc:
-                    entries_acc[key] = [0.0, 0.0]
-                entries_acc[key][0] += fuel_sum
-                entries_acc[key][1] += discount_sum
-
-                processed += 1
-                if processed % progress_step == 0:
-                    pct = int((processed / max(1, len(df))) * 100)
+                if val is None or (isinstance(val, float) and val != val):
+                    return None
+                if pd.isna(val):
+                    return None
+                if isinstance(val, pd.Timestamp):
+                    return val.date()
+                if isinstance(val, dt_mod.datetime):
+                    return val.date()
+                if isinstance(val, dt_mod.date):
+                    return val
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
                     try:
-                        await last_progress.edit_text(f"⏳ Fuel xlsx ishlanmoqda... {pct}%")
+                        n = float(val)
+                        if 20000 < n < 100000:
+                            dt = pd.to_datetime(n, unit="D", origin="1899-12-30", errors="coerce")
+                            if pd.notna(dt):
+                                return dt.date()
                     except Exception:
                         pass
+                s = str(val).strip()
+                if not s or s.lower() == "nan":
+                    return None
+                try:
+                    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+                    if pd.isna(dt):
+                        return None
+                    return dt.date()
+                except Exception:
+                    return None
+
+            def fuel_rows_to_acc(df_part, ci, di, qi, ai):
+                """df_part — faqat ma'lumot qatorlari (sarlavhasiz)."""
+                acc = {}
+                for r in range(len(df_part)):
+                    row = df_part.iloc[r]
+                    n = len(row)
+                    def gc(j):
+                        return row.iloc[j] if j < n else None
+                    card_val = normalize_card_str(gc(ci))
+                    if not card_val:
+                        continue
+                    trans_date = parse_fuel_tran_date(gc(di))
+                    if trans_date is None:
+                        continue
+                    date_iso = trans_date.isoformat()
+                    discount_sum = parse_money(gc(qi))
+                    fuel_sum = parse_money(gc(ai))
+                    key = (card_val, date_iso)
+                    if key not in acc:
+                        acc[key] = [0.0, 0.0]
+                    acc[key][0] += fuel_sum
+                    acc[key][1] += discount_sum
+                return acc
+
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content_bytes))
+            except Exception:
+                await message.answer("❌ Fuel uchun xlsx faylni o‘qib bo‘lmadi.")
+                return
+
+            last_progress = await message.answer("⏳ Fuel xlsx o‘qilmoqda...")
+
+            entries_acc = {}
+            sheets_tried = []
+            for sheet_name in xls.sheet_names:
+                sheets_tried.append(sheet_name)
+                acc = {}
+
+                # A) Birinchi qator = ustun nomlari (Delo / EFS eksport — eng ko'p holat)
+                try:
+                    df0 = pd.read_excel(xls, sheet_name=sheet_name, header=0, dtype=object)
+                except Exception:
+                    df0 = None
+                if df0 is not None and df0.shape[1] >= 4:
+                    colmap = find_fuel_columns_from_named_dataframe(df0)
+                    if colmap:
+                        ci, di, qi, ai = colmap
+                        acc = fuel_rows_to_acc(df0, ci, di, qi, ai)
+
+                if acc:
+                    entries_acc = acc
+                    break
+
+                # B) Sarlavha 2–45 qatorlarda yoki birlashtirilgan kataklar tufayli header=None
+                try:
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None, dtype=object)
+                except Exception:
+                    continue
+                if df.shape[1] < 4:
+                    continue
+                found = find_fuel_transaction_header_map(df)
+                if found:
+                    hr, ci, di, qi, ai = found
+                    acc = fuel_rows_to_acc(df.iloc[hr + 1 :], ci, di, qi, ai)
+                if acc:
+                    entries_acc = acc
+                    break
+
+            if not entries_acc:
+                hint = ""
+                if not sheets_tried:
+                    hint = "Fayl ichida varaq topilmadi."
+                else:
+                    hint = (
+                        "Kerakli ustunlar topilmadi yoki yozuvlar o'qilmadi (sana/karta). "
+                        "Birinchi qatorda <b>Card #</b>, <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> bo'lsin; "
+                        "faylni Excelda <b>.xlsx</b> qilib qayta saqlang (CSV emas)."
+                    )
+                try:
+                    await last_progress.edit_text(
+                        "❌ Fuel fayldan ma'lumot chiqmadi.\n" + hint
+                    )
+                except Exception:
+                    await message.answer("❌ Fuel fayldan ma'lumot chiqmadi.\n" + hint)
+                return
 
             try:
                 await last_progress.edit_text("✅ Fayl tayyor. Qaysi listni tekshiramiz?")
@@ -192,6 +542,19 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 fuel_filename=file_name,
                 selected_company=company,
             )
+
+            picked_tab = autopick_fuel_expense_tab(sheet_candidates, fuel_entries)
+            if picked_tab:
+                try:
+                    await last_progress.edit_text(
+                        f"✅ Ro'yxat: <b>{picked_tab}</b> (avtomatik). Google Sheets ga yozilmoqda..."
+                    )
+                except Exception:
+                    pass
+                await apply_fuel_named_week_to_sheet(
+                    last_progress, state, company, picked_tab, fuel_entries, file_name
+                )
+                return
 
             # Inline keyboard (2 ustun)
             buttons = []
@@ -330,7 +693,10 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
     sheet_names = data.get("fuel_sheet_names") or []
     fuel_entries = data.get("fuel_entries") or []
     if not sheet_names or not fuel_entries:
-        await callback.message.edit_text("❌ Ma'lumotlar topilmadi. Qaytadan Fuel fayl yuboring.")
+        await callback.message.edit_text(
+            "❌ Ma'lumotlar topilmadi (sessiya tugagan yoki faylda yozuv yo'q). "
+            "Qaytadan Fuel fayl yuboring — bot qayta ishga tushgan bo'lsa, state saqlanmaydi."
+        )
         await state.set_state(BotStates.Fuel)
         return
 
@@ -353,126 +719,16 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
 
     sheet_service = get_sheet_service()
 
-    # 1) Agar sheet nomida aniq sana oralig'i bo'lsa -> shu bilan ishlaymiz
-    range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
-    year_m = re.search(r'(\d{4})', sheet_name)
+    year_m = re.search(r"(\d{4})", sheet_name)
     year = int(year_m.group(1)) if year_m else datetime.now().year
 
-    m = range_re.search(sheet_name)
-    if m:
-        start_str, end_str = m.group(1), m.group(2)
-        start_month, start_day = map(int, start_str.split('.'))
-        end_month, end_day = map(int, end_str.split('.'))
-        start_date = date(year, start_month, start_day)
-        end_year = year
-        if (end_month, end_day) < (start_month, start_day):
-            end_year = year + 1
-        end_date = date(end_year, end_month, end_day)
-
-        # card_totals uchun filtr
-        card_totals = {}
-        for item in fuel_entries:
-            try:
-                item_date = datetime.fromisoformat(item["date"]).date()
-            except Exception:
-                continue
-            if not (start_date <= item_date <= end_date):
-                continue
-            card = str(item.get("card", "")).strip()
-            if not card:
-                continue
-            fuel_sum = float(item.get("fuel", 0.0) or 0.0)
-            discount_sum = float(item.get("discount", 0.0) or 0.0)
-            if card not in card_totals:
-                card_totals[card] = [0.0, 0.0]
-            card_totals[card][0] += fuel_sum
-            card_totals[card][1] += discount_sum
-
-        if not card_totals:
-            await callback.message.edit_text(f"List <b>{sheet_name}</b> oralig'ida mos yozuv topilmadi.")
-            await state.set_state(BotStates.Fuel)
-            return
-
-        # Nomdan sana oralig'i bo'lgan holatlarda E/F ustunlari odatda shunday (bizning eski taxmin)
-        card_totals_tuple = {k: (v[0], v[1]) for k, v in card_totals.items()}
-        updated, skipped, missing_count, missing_cards = sheet_service.update_fuel_toll_expenses(
-            sheet_name,
-            card_totals_tuple,
-            fuel_col=5,  # E = Fuel after discount
-            discount_col=6,  # F = Discount (Disc Amt dan, Toll Exp emas)
-            company=company,
+    # 1) Sheet nomida hafta oralig'i (masalan 03.30-04.05) bo'lsa — umumiy yozuv funksiyasi
+    range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
+    if range_re.search(sheet_name):
+        fn = data.get("fuel_filename") or "fuel.xlsx"
+        await apply_fuel_named_week_to_sheet(
+            callback.message, state, company, sheet_name, fuel_entries, fn
         )
-
-        # Excel report (textda detalli matn yuborilmaydi)
-        report_rows = []
-        missing_set = set(str(x) for x in (missing_cards or []))
-        week_label = f"{start_str}-{end_str}"
-
-        for card, (fuel_sum, discount_sum) in card_totals_tuple.items():
-            card_s = str(card)
-            if (fuel_sum or 0) == 0 and (discount_sum or 0) == 0:
-                continue
-            status = "TOPILMADI" if card_s in missing_set else "TOPILDI"
-            report_rows.append({
-                "Sheet": sheet_name,
-                "Week": week_label,
-                "Card": card_s,
-                "FuelSum": fuel_sum,
-                "DiscountSum": discount_sum,
-                "Status": status,
-            })
-
-        try:
-            import pandas as pd
-            import os
-            import tempfile
-            from aiogram.types import FSInputFile
-
-            report_df = pd.DataFrame(report_rows)
-            data_all = await state.get_data()
-            src_file = data_all.get("fuel_filename") or "fuel.xlsx"
-            base = os.path.splitext(str(src_file))[0]
-
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            tmp_path = tmp.name
-            tmp.close()
-
-            report_df.to_excel(tmp_path, index=False)
-            # Status ustunini bo'yash: TOPILDI=green, TOPILMADI=red
-            try:
-                from openpyxl import load_workbook
-                from openpyxl.styles import PatternFill
-
-                wb = load_workbook(tmp_path)
-                ws_rep = wb.active
-                status_col_idx = None
-                for c in range(1, ws_rep.max_column + 1):
-                    if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
-                        status_col_idx = c
-                        break
-
-                if status_col_idx:
-                    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-                    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-                    for r in range(2, ws_rep.max_row + 1):
-                        cell = ws_rep.cell(row=r, column=status_col_idx)
-                        v = str(cell.value).strip().upper() if cell.value is not None else ""
-                        if v == "TOPILDI":
-                            cell.fill = green_fill
-                        elif v == "TOPILMADI":
-                            cell.fill = red_fill
-
-                    wb.save(tmp_path)
-            except Exception:
-                pass
-            await callback.message.answer_document(FSInputFile(tmp_path))
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-        await callback.message.edit_text("✅ Fuel yozildi. (Excel report yuborildi)")
-
-        await state.set_state(BotStates.Fuel)
         return
 
     # 2) Agar sheet nomida oralig' bo'lmasa (masalan Owner Operators) -> sheet ichidan sana va ustunlarni topamiz
