@@ -109,6 +109,153 @@ def find_fuel_transaction_header_map(df) -> tuple[int, int, int, int, int] | Non
     return None
 
 
+def _toll_col_key(name) -> str:
+    """Ustun nomini taqqoslash uchun kalit (faqat harf va raqam)."""
+    import re
+
+    flat = _flatten_column_name(name).replace("\ufeff", "")
+    s = re.sub(r"[^a-z0-9]", "", flat.lower())
+    return s
+
+
+def match_toll_named_columns(df) -> tuple[str, str, str] | None:
+    """
+    PostingDate, PPTagID, Toll_Amount ustunlarini topadi.
+    Qaytaradi: (posting_col, pptag_col, toll_amount_col) yoki None.
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        return None
+    col_map = {}
+    for c in df.columns:
+        k = _toll_col_key(c)
+        if k and k not in col_map:
+            col_map[k] = c
+
+    def get_col(*aliases):
+        for a in aliases:
+            ak = _toll_col_key(a)
+            if ak in col_map:
+                return col_map[ak]
+        return None
+
+    posting = get_col("PostingDate", "postingdate", "post date", "postdate")
+    if not posting:
+        for k, col in col_map.items():
+            if "posting" in k and "date" in k:
+                posting = col
+                break
+    if not posting:
+        for k, col in col_map.items():
+            if k in ("postdate",) or (k.startswith("post") and k.endswith("date") and "invoice" not in k):
+                posting = col
+                break
+
+    pptag = get_col("PPTagID", "pptagid", "pptag", "ppdeviceid", "ppdevice")
+    if not pptag:
+        for k, col in col_map.items():
+            if "pptag" in k:
+                pptag = col
+                break
+
+    toll_amt = get_col("Toll_Amount", "tollamount", "toll_amt", "toll amt")
+    if not toll_amt:
+        for k, col in col_map.items():
+            if "toll" in k and "amount" in k:
+                toll_amt = col
+                break
+
+    if posting and pptag and toll_amt:
+        return posting, pptag, toll_amt
+    return None
+
+
+def parse_toll_posting_date(val):
+    """PostingDate (masalan DD.MM.YYYY) -> date yoki None."""
+    from datetime import datetime
+
+    import pandas as pd
+
+    if val is None or (isinstance(val, float) and val != val):
+        return None
+    if pd.isna(val):
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return None
+    # Excel serial (taxminiy)
+    try:
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            v = float(val)
+            if 30000 < v < 60000:
+                from datetime import date, timedelta
+
+                base = date(1899, 12, 30)
+                return base + timedelta(days=int(v))
+    except Exception:
+        pass
+    for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(val, dayfirst=True).date()
+    except Exception:
+        return None
+
+
+def parse_toll_amount_positive_only(val):
+    """
+    Toll summasini qaytaradi; manfiy yoki '-' bilan boshlangan qiymatlar None (tashlab ketiladi).
+    Vergul bilan o'nlik ajratuvchi (0,9) qo'llab-quvvatlanadi.
+    """
+    import re
+
+    import pandas as pd
+
+    if val is None or (isinstance(val, float) and val != val):
+        return None
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if val < 0:
+            return None
+        return float(val)
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return None
+    s_clean = s.replace("$", "").replace(" ", "").replace("\xa0", "")
+    if s_clean.startswith("-"):
+        return None
+    if "," in s_clean and "." in s_clean:
+        if s_clean.rfind(",") > s_clean.rfind("."):
+            s_clean = s_clean.replace(".", "").replace(",", ".")
+        else:
+            s_clean = s_clean.replace(",", "")
+    elif "," in s_clean and "." not in s_clean:
+        parts = s_clean.split(",")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            s_clean = parts[0].replace(".", "") + "." + parts[1]
+        else:
+            s_clean = s_clean.replace(",", "")
+    else:
+        s_clean = s_clean.replace(",", "")
+    m = re.search(r"\d+(\.\d+)?", s_clean)
+    if not m:
+        return None
+    try:
+        f = float(m.group())
+        if f < 0:
+            return None
+        return f
+    except ValueError:
+        return None
+
+
 def find_fuel_columns_from_named_dataframe(df) -> tuple[int, int, int, int] | None:
     """pd.read_excel(header=0) — ustun nomlari Card #, Tran Date, ... bo'lsa."""
     if df is None or df.empty:
@@ -304,8 +451,12 @@ async def enter_toll(message: types.Message, state: FSMContext):
         await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
         return
     await state.set_state(BotStates.Toll)
-    await message.answer("Toll Expenses bo'limi.\n"
-                         "Iltimos, Excel (xlsx, xls) faylini yuboring.", reply_markup=expenses_menu)
+    await message.answer(
+        "Toll Expenses bo'limi.\n"
+        "Excel (xlsx, xls) yuboring — jadvalda <b>PostingDate</b>, <b>PPTagID</b>, <b>Toll_Amount</b> "
+        "ustunlari bo'lsa bot o'zi topadi (manfiy Toll_Amount qatorlari hisobga olinmaydi).",
+        reply_markup=expenses_menu,
+    )
 
 @dp.message(F.text == "⬅️ Back (Main Menu)", BotStates.Fuel)
 @dp.message(F.text == "⬅️ Back (Main Menu)", BotStates.Toll)
@@ -575,35 +726,38 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             )
             return
 
-        # -------------------- TOLL (PrePass Customer Toll Details) --------------------
+        # -------------------- TOLL (PostingDate / PPTagID / Toll_Amount yoki PrePass legacy) --------------------
         if expense_type == "TOLL":
-            # Sheet1: A=Post Date, E=PP Device ID, W=Toll $
-            # PP Device ID ni sheetsdagi Transponder (D) bn solishtirib, hafta bo'yicha Toll Exp ga yoziladi
+            df = None
+            toll_mode = None  # "named" | "prepass"
             try:
-                # PrePass: header row 9 (0-indexed: 8), data row 10+
-                df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=0, header=8, dtype=str)
+                df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=0, header=0, dtype=str)
             except Exception:
+                df = None
+
+            named = match_toll_named_columns(df) if df is not None else None
+
+            if named:
+                toll_mode = "named"
+                col_post, col_pp, col_toll = named
+            else:
+                toll_mode = None
                 try:
-                    df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=0, dtype=str)
+                    df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=0, header=8, dtype=str)
                 except Exception:
-                    await message.answer("❌ Toll uchun xlsx faylni o'qib bo'lmadi.")
+                    try:
+                        df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=0, dtype=str)
+                    except Exception:
+                        await message.answer("❌ Toll uchun xlsx faylni o'qib bo'lmadi.")
+                        return
+                if df is not None and df.shape[1] > 22:
+                    toll_mode = "prepass"
+                else:
+                    await message.answer(
+                        "❌ Toll faylda PostingDate, PPTagID, Toll_Amount ustunlari topilmadi "
+                        "(yoki PrePass uchun kamida 23 ustun kerak)."
+                    )
                     return
-
-            if df.shape[1] <= 22:
-                await message.answer("❌ Toll xlsx faylda kamida 23 ta ustun bo'lishi kerak (W indeksi uchun).")
-                return
-
-            def parse_money(val):
-                if val is None or (isinstance(val, float) and val != val) or pd.isna(val):
-                    return 0.0
-                s = str(val).strip().replace("$", "").replace(" ", "").replace(",", "")
-                m = re.search(r'-?\d+(\.\d+)?', s)
-                if not m:
-                    return 0.0
-                try:
-                    return float(m.group())
-                except ValueError:
-                    return 0.0
 
             def normalize_transponder(v):
                 if v is None or pd.isna(v):
@@ -615,24 +769,56 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     s = s[:-2]
                 return s
 
-            # (pp_device_id, date_iso) -> toll_sum (jamlash)
-            entries_acc = {}
-            for _, row in df.iterrows():
-                date_val = row.iloc[0]   # A = Post Date
-                pp_id = normalize_transponder(row.iloc[4])   # E = PP Device ID
-                toll_val = parse_money(row.iloc[22])         # W = Toll $
-
-                if not pp_id:
-                    continue
+            def parse_money_legacy(val):
+                if val is None or (isinstance(val, float) and val != val) or pd.isna(val):
+                    return 0.0
+                s = str(val).strip().replace("$", "").replace(" ", "").replace(",", "")
+                m = re.search(r"-?\d+(\.\d+)?", s)
+                if not m:
+                    return 0.0
                 try:
-                    trans_date = pd.to_datetime(date_val).date()
-                except Exception:
-                    continue
+                    return float(m.group())
+                except ValueError:
+                    return 0.0
 
-                key = (pp_id, trans_date.isoformat())
-                if key not in entries_acc:
-                    entries_acc[key] = 0.0
-                entries_acc[key] += toll_val
+            entries_acc = {}
+
+            if toll_mode == "named":
+                for _, row in df.iterrows():
+                    date_val = row[col_post]
+                    pp_id = normalize_transponder(row[col_pp])
+                    toll_val = parse_toll_amount_positive_only(row[col_toll])
+
+                    if not pp_id or toll_val is None:
+                        continue
+                    trans_date = parse_toll_posting_date(date_val)
+                    if not trans_date:
+                        continue
+
+                    key = (pp_id, trans_date.isoformat())
+                    if key not in entries_acc:
+                        entries_acc[key] = 0.0
+                    entries_acc[key] += toll_val
+
+            else:
+                # PrePass: A=Post Date, E=PP Device ID, W=Toll $
+                for _, row in df.iterrows():
+                    date_val = row.iloc[0]
+                    pp_id = normalize_transponder(row.iloc[4])
+                    toll_raw = parse_money_legacy(row.iloc[22])
+                    if toll_raw < 0:
+                        continue
+                    if not pp_id:
+                        continue
+                    try:
+                        trans_date = pd.to_datetime(date_val).date()
+                    except Exception:
+                        continue
+
+                    key = (pp_id, trans_date.isoformat())
+                    if key not in entries_acc:
+                        entries_acc[key] = 0.0
+                    entries_acc[key] += toll_raw
 
             toll_entries = [
                 {"transponder": pp_id, "date": date_iso, "toll": toll_sum}
@@ -640,7 +826,10 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             ]
 
             if not toll_entries:
-                await message.answer("❌ Toll faylda ma'lumot topilmadi (A, E, W ustunlari tekshirilsin).")
+                await message.answer(
+                    "❌ Toll faylda ma'lumot topilmadi (PostingDate, PPTagID, Toll_Amount "
+                    "yoki PrePass A/E/W tekshirilsin; manfiy Toll_Amount qatorlari hisobga olinmaydi)."
+                )
                 return
 
             expenses_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
