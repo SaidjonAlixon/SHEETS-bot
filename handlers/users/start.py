@@ -23,14 +23,8 @@ async def bot_start(message: types.Message):
 
 @dp.message(F.text.in_(LOAD_BUTTONS))
 async def on_load_selected(message: types.Message):
-    from keyboards.default.main_menu import get_main_menu, get_load_select_menu
+    from keyboards.default.main_menu import get_main_menu
     from utils.company_storage import set_company
     load_name = message.text.strip()
-    if load_name == "BUTATA":
-        await message.answer(
-            "⚠️ BUTATA vaqtincha ishlamayapti. Iltimos, keyinroq qayta urinib ko'ring yoki boshqa Load tanlang.",
-            reply_markup=get_load_select_menu(message.from_user.id),
-        )
-        return
     set_company(message.from_user.id, load_name)
     await message.answer(f"✅ {load_name} tanlandi. Iltimos bo'limni tanlang:", reply_markup=get_main_menu(message.from_user.id))

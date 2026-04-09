@@ -84,6 +84,12 @@ async def callback_broker_recent(callback: types.CallbackQuery):
     try:
         sheet_service = get_sheet_service()
         all_sheets = sheet_service.get_all_sheet_names(company)
+    except PermissionError:
+        await callback.message.edit_text(
+            "❌ Google Sheetga ruxsat yo'q. Tanlangan load uchun sheet "
+            "service account bilan ulashilmagan bo'lishi mumkin."
+        )
+        return
     except Exception as e:
         await callback.message.edit_text(f"Xatolik: {e}")
         return
@@ -206,6 +212,12 @@ async def handle_broker_document(message: types.Message):
             await progress_msg.edit_text("✅ Broker Payments yakunlandi... 100%")
         except Exception:
             pass
+    except PermissionError:
+        await message.answer(
+            "❌ Google Sheetga ruxsat yo'q. Tanlangan load uchun sheet "
+            "service account bilan ulashilmagan bo'lishi mumkin."
+        )
+        return
     except GspreadAPIError as e:
         if "429" in str(e):
             await message.answer("⚠️ Google Sheets limiti tugadi. 1-2 daqiqa kutib qayta yuboring.")
