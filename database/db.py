@@ -103,6 +103,14 @@ class Database:
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Tanlangan Load / kompaniya (bot qayta ishga tushganda ham eslab qoladi)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_company (
+                    user_id BIGINT PRIMARY KEY,
+                    company VARCHAR(100) NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             self.connection.commit()
         except Exception as e:
             print(f"Error creating tables: {e}")
@@ -179,6 +187,39 @@ class Database:
         except Exception as e:
             print(f"Error get_logs_by_user: {e}")
             return []
+
+    def set_user_company(self, user_id: int, company: str) -> None:
+        if not self.connection:
+            return
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO user_company (user_id, company, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    company = EXCLUDED.company,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, company),
+            )
+            self.connection.commit()
+        except Exception as e:
+            print(f"set_user_company error: {e}")
+            self.connection.rollback()
+
+    def get_user_company(self, user_id: int):
+        if not self.connection:
+            return None
+        try:
+            self.cursor.execute(
+                "SELECT company FROM user_company WHERE user_id = %s",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            return row["company"] if row else None
+        except Exception as e:
+            print(f"get_user_company error: {e}")
+            return None
 
     def close(self):
         if self.connection:

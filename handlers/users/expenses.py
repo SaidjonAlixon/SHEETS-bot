@@ -320,6 +320,9 @@ def find_fuel_columns_from_named_dataframe(df) -> tuple[int, int, int, int] | No
 def autopick_fuel_expense_tab(sheet_candidates: list, fuel_entries: list) -> str | None:
     """Barcha tranzaksiya sanalari bitta hafta-list oralig'iga tushsa, o'sha list nomini qaytaradi."""
     import re
+    import re
+    import re
+    import re
     from datetime import datetime, date
     if not sheet_candidates or not fuel_entries:
         return None
@@ -355,6 +358,14 @@ def autopick_fuel_expense_tab(sheet_candidates: list, fuel_entries: list) -> str
     return None
 
 
+def _find_sheet_by_alias(sheet_names: list[str], alias: str) -> str | None:
+    target = str(alias or "").strip().lower()
+    for n in sheet_names or []:
+        if str(n).strip().lower() == target:
+            return n
+    return None
+
+
 async def apply_fuel_named_week_to_sheet(
     status_msg,
     state: FSMContext,
@@ -371,6 +382,9 @@ async def apply_fuel_named_week_to_sheet(
     import re
     import tempfile
     import pandas as pd
+    import re
+    import re
+    import re
     from datetime import datetime, date
     from aiogram.types import FSInputFile
     from services.google_sheets import get_sheet_service
@@ -637,6 +651,7 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             def fuel_rows_to_acc(df_part, ci, di, qi, ai):
                 """df_part — faqat ma'lumot qatorlari (sarlavhasiz)."""
                 acc = {}
+                seen_cards = set()
                 for r in range(len(df_part)):
                     row = df_part.iloc[r]
                     n = len(row)
@@ -645,6 +660,7 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     card_val = normalize_card_str(gc(ci))
                     if not card_val:
                         continue
+                    seen_cards.add(card_val)
                     trans_date = parse_fuel_tran_date(gc(di))
                     if trans_date is None:
                         continue
@@ -656,7 +672,7 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                         acc[key] = [0.0, 0.0]
                     acc[key][0] += fuel_sum
                     acc[key][1] += discount_sum
-                return acc
+                return acc, seen_cards
 
             try:
                 xls = pd.ExcelFile(io.BytesIO(content_bytes))
@@ -667,10 +683,12 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             last_progress = await message.answer("⏳ Fuel xlsx o‘qilmoqda...")
 
             entries_acc = {}
+            all_seen_cards = set()
             sheets_tried = []
             for sheet_name in xls.sheet_names:
                 sheets_tried.append(sheet_name)
                 acc = {}
+                seen_cards_local = set()
 
                 # A) Birinchi qator = ustun nomlari (Delo / EFS eksport — eng ko'p holat)
                 try:
@@ -681,7 +699,8 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     colmap = find_fuel_columns_from_named_dataframe(df0)
                     if colmap:
                         ci, di, qi, ai = colmap
-                        acc = fuel_rows_to_acc(df0, ci, di, qi, ai)
+                        acc, seen_cards_local = fuel_rows_to_acc(df0, ci, di, qi, ai)
+                        all_seen_cards.update(seen_cards_local)
 
                 if acc:
                     entries_acc = acc
@@ -697,7 +716,8 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 found = find_fuel_transaction_header_map(df)
                 if found:
                     hr, ci, di, qi, ai = found
-                    acc = fuel_rows_to_acc(df.iloc[hr + 1 :], ci, di, qi, ai)
+                    acc, seen_cards_local = fuel_rows_to_acc(df.iloc[hr + 1 :], ci, di, qi, ai)
+                    all_seen_cards.update(seen_cards_local)
                 if acc:
                     entries_acc = acc
                     break
@@ -720,61 +740,37 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     await message.answer("❌ Fuel fayldan ma'lumot chiqmadi.\n" + hint)
                 return
 
-            try:
-                await last_progress.edit_text("✅ Fayl tayyor. Qaysi listni tekshiramiz?")
-            except Exception:
-                pass
-
-            # Sheets listlarini ko‘rsatamiz (expenses spreadsheetdan)
-            expenses_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
-            range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
-            sheet_candidates = [s for s in expenses_sheet_names if range_re.search(s)]
-            if not sheet_candidates:
-                sheet_candidates = expenses_sheet_names
-
-            # Statega saqlaymiz (discount = Disc Amt, Discount ustuniga yoziladi)
             fuel_entries = []
             for (card, date_iso), (fuel_sum, discount_sum) in entries_acc.items():
                 fuel_entries.append({"card": card, "date": date_iso, "fuel": fuel_sum, "discount": discount_sum})
+            expenses_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
+            owner_name = _find_sheet_by_alias(expenses_sheet_names, "Owner Operators")
+            company_name = _find_sheet_by_alias(expenses_sheet_names, "Company Drivers")
+            terminated_name = _find_sheet_by_alias(expenses_sheet_names, "TERMINATED")
+
+            if not ((owner_name and company_name) or terminated_name):
+                await last_progress.edit_text("❌ Kerakli listlar topilmadi (Owner/Company yoki TERMINATED).")
+                await state.set_state(BotStates.Fuel)
+                return
 
             await state.set_state(BotStates.FuelSheetSelect)
             await state.update_data(
                 fuel_entries=fuel_entries,
-                fuel_sheet_names=sheet_candidates,
-                fuel_filename=file_name,
+                fuel_all_cards=sorted(all_seen_cards),
                 selected_company=company,
+                fuel_owner_company=[x for x in [owner_name, company_name] if x],
+                fuel_terminated=[x for x in [terminated_name] if x],
+                fuel_filename=file_name,
             )
 
-            picked_tab = autopick_fuel_expense_tab(sheet_candidates, fuel_entries)
-            if picked_tab:
-                try:
-                    await last_progress.edit_text(
-                        f"✅ Ro'yxat: <b>{picked_tab}</b> (avtomatik). Google Sheets ga yozilmoqda..."
-                    )
-                except Exception:
-                    pass
-                await apply_fuel_named_week_to_sheet(
-                    last_progress, state, company, picked_tab, fuel_entries, file_name
-                )
-                return
-
-            # Inline keyboard (2 ustun)
-            buttons = []
-            row = []
-            for i, name in enumerate(sheet_candidates):
-                row.append(InlineKeyboardButton(text=name, callback_data=f"fuel_sheet:{i}"))
-                if len(row) == 2:
-                    buttons.append(row)
-                    row = []
-            if row:
-                buttons.append(row)
-            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-            await message.answer(
-                "📋 Qaysi listni tekshiramiz?\n"
-                "Tugmani bosing — natija tez orada chiqadi.",
-                reply_markup=kb
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Owner&Company", callback_data="fuel_scope:owner_company")],
+                    [InlineKeyboardButton(text="TERMINATED", callback_data="fuel_scope:terminated")],
+                ]
             )
+            await last_progress.edit_text("✅ Fayl tayyor. Qaysi list(lar)ni tekshiramiz?")
+            await message.answer("Tugmani bosing:", reply_markup=kb)
             return
 
         # -------------------- TOLL (PostingDate / PPTagID / Toll_Amount yoki PrePass legacy) --------------------
@@ -884,41 +880,598 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 return
 
             expenses_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
-            range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
-            sheet_candidates = [s for s in expenses_sheet_names if range_re.search(s)]
-            if not sheet_candidates:
-                sheet_candidates = expenses_sheet_names
+            owner_name = _find_sheet_by_alias(expenses_sheet_names, "Owner Operators")
+            company_name = _find_sheet_by_alias(expenses_sheet_names, "Company Drivers")
+            terminated_name = _find_sheet_by_alias(expenses_sheet_names, "TERMINATED")
+
+            if not ((owner_name and company_name) or terminated_name):
+                await message.answer("❌ Kerakli listlar topilmadi (Owner/Company yoki TERMINATED).")
+                await state.set_state(BotStates.Toll)
+                return
 
             await state.set_state(BotStates.TollSheetSelect)
             await state.update_data(
                 toll_entries=toll_entries,
-                toll_sheet_names=sheet_candidates,
-                toll_filename=file_name,
                 selected_company=company,
+                toll_owner_company=[x for x in [owner_name, company_name] if x],
+                toll_terminated=[x for x in [terminated_name] if x],
+                toll_filename=file_name,
             )
 
-            buttons = []
-            row_btns = []
-            for i, name in enumerate(sheet_candidates):
-                row_btns.append(InlineKeyboardButton(text=name, callback_data=f"toll_sheet:{i}"))
-                if len(row_btns) == 2:
-                    buttons.append(row_btns)
-                    row_btns = []
-            if row_btns:
-                buttons.append(row_btns)
-            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-            await message.answer(
-                "✅ Fayl tayyor. Qaysi listni tekshiramiz?\n"
-                "Tugmani bosing — natija tez orada chiqadi.",
-                reply_markup=kb
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Owner&Company", callback_data="toll_scope:owner_company")],
+                    [InlineKeyboardButton(text="TERMINATED", callback_data="toll_scope:terminated")],
+                ]
             )
+            await message.answer("✅ Fayl tayyor. Qaysi list(lar)ni tekshiramiz?", reply_markup=kb)
             return
 
         await message.answer("❌ Noma'lum expense_type.")
 
     except Exception as e:
         await message.answer(f"❌ Xatolik yuz berdi: {e}")
+
+
+@dp.callback_query(F.data.startswith("fuel_scope:"), BotStates.FuelSheetSelect)
+async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    company = data.get("selected_company") or get_company(callback.from_user.id)
+    if not company:
+        await callback.message.edit_text("Iltimos, /start bosing va Load tanlang.")
+        return
+
+    scope = callback.data.replace("fuel_scope:", "").strip()
+    if scope == "owner_company":
+        sheet_names = data.get("fuel_owner_company") or []
+    elif scope == "terminated":
+        sheet_names = data.get("fuel_terminated") or []
+    else:
+        sheet_names = []
+    fuel_entries = data.get("fuel_entries") or []
+    fuel_all_cards = data.get("fuel_all_cards") or []
+    if not sheet_names or not fuel_entries:
+        await callback.message.edit_text("❌ Ma'lumotlar topilmadi. Qaytadan Fuel fayl yuboring.")
+        await state.set_state(BotStates.Fuel)
+        return
+
+    await callback.message.edit_text("⏳ Tanlangan list(lar) bo'yicha tekshirilmoqda...")
+    from services.google_sheets import get_sheet_service
+    sheet_service = get_sheet_service()
+
+    import re
+    from datetime import datetime, date
+    report_rows = []
+    assigned_entry_idx = set()
+    unmatched_by_date = {}
+
+    # Umumiy card total (yakuniy topilmaganlar uchun)
+    card_totals_all = {}
+    for item in fuel_entries:
+        card = str(item.get("card", "")).strip()
+        if not card:
+            continue
+        fuel_sum = float(item.get("fuel", 0.0) or 0.0)
+        discount_sum = float(item.get("discount", 0.0) or 0.0)
+        if card not in card_totals_all:
+            card_totals_all[card] = [0.0, 0.0]
+        card_totals_all[card][0] += fuel_sum
+        card_totals_all[card][1] += discount_sum
+
+    for sheet_name in sheet_names:
+        ws = sheet_service.get_expenses_board(sheet_name, company)
+        if not ws:
+            continue
+
+        top_grid = ws.get("A1:Z10")
+        seg_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
+        date_matches = []
+        for r in range(min(len(top_grid), 10)):
+            row_data = top_grid[r] if r < len(top_grid) else []
+            for c in range(min(26, len(row_data))):
+                cell = row_data[c] if c < len(row_data) else None
+                if cell is None:
+                    continue
+                cell_s = str(cell)
+                m2 = seg_re.search(cell_s)
+                if not m2:
+                    continue
+                year_m = re.search(r"(\d{4})", cell_s)
+                year_cell = int(year_m.group(1)) if year_m else datetime.now().year
+                sm, sd = map(int, m2.group(1).split("."))
+                em, ed = map(int, m2.group(2).split("."))
+                s_date = date(year_cell, sm, sd)
+                e_year = year_cell + 1 if (em, ed) < (sm, sd) else year_cell
+                e_date = date(e_year, em, ed)
+                date_matches.append((s_date, e_date, c + 1))
+        uniq = {}
+        for s_date, e_date, c in date_matches:
+            uniq[(s_date, e_date, c)] = True
+        date_matches = sorted(list(uniq.keys()), key=lambda x: x[2])
+
+        card_cols, fuel_cols, discount_cols = [], [], []
+        for r in range(min(10, len(top_grid))):
+            row_data = top_grid[r] if r < len(top_grid) else []
+            for c in range(min(26, len(row_data))):
+                cell = row_data[c] if c < len(row_data) else None
+                if cell is None:
+                    continue
+                txt = str(cell).strip().lower()
+                if not txt:
+                    continue
+                if ("card" in txt and "efs" in txt) or txt == "card #":
+                    card_cols.append(c + 1)
+                if "fuel" in txt and ("exp" in txt or "after" in txt or "amount" in txt):
+                    fuel_cols.append(c + 1)
+                if "fuel" not in txt and ("discount" in txt or "disc" in txt):
+                    discount_cols.append(c + 1)
+        if not fuel_cols:
+            fuel_cols = [5]
+        if not discount_cols:
+            discount_cols = [6]
+        if not card_cols:
+            card_cols = [3, 4]
+
+        segments = []
+        if date_matches:
+            for i in range(len(date_matches)):
+                s_date, e_date, start_col = date_matches[i]
+                end_col = (date_matches[i + 1][2] - 1) if i + 1 < len(date_matches) else 26
+                f_col = next((fc for fc in fuel_cols if start_col <= fc <= end_col), fuel_cols[0])
+                d_col = next((dc for dc in discount_cols if start_col <= dc <= end_col), discount_cols[0])
+                c_col = next((cc for cc in card_cols if start_col <= cc <= end_col), card_cols[0])
+                segments.append(
+                    {
+                        "label": f"{s_date.strftime('%m.%d')}-{e_date.strftime('%m.%d')}",
+                        "start_date": s_date,
+                        "end_date": e_date,
+                        "card_col": c_col,
+                        "fuel_col": f_col,
+                        "discount_col": d_col,
+                    }
+                )
+        else:
+            # Sana blok topilmasa noto'g'ri haftaga yozmaslik uchun skip qilamiz.
+            continue
+
+        seg_card_sets = {}
+        sheet_card_set = set()
+        unique_card_cols = sorted({int(seg["card_col"]) for seg in segments})
+        for cc in unique_card_cols:
+            try:
+                raw_cards = ws.col_values(cc)
+            except Exception:
+                raw_cards = []
+            cset = set()
+            for v in raw_cards[3:]:
+                nv = sheet_service._normalize_load_num(v)
+                if nv:
+                    cset.add(nv)
+            seg_card_sets[cc] = cset
+            sheet_card_set.update(cset)
+
+        card_totals_by_seg = {i: {} for i in range(len(segments))}
+        for idx, item in enumerate(fuel_entries):
+            if idx in assigned_entry_idx:
+                continue
+            card = str(item.get("card", "")).strip()
+            if not card:
+                continue
+            ncard = sheet_service._normalize_load_num(card)
+            if not ncard or ncard not in sheet_card_set:
+                continue
+            try:
+                item_date = datetime.fromisoformat(item["date"]).date()
+            except Exception:
+                continue
+            fuel_sum = float(item.get("fuel", 0.0) or 0.0)
+            discount_sum = float(item.get("discount", 0.0) or 0.0)
+            placed = False
+            for i, seg in enumerate(segments):
+                if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
+                    continue
+                seg_cards = seg_card_sets.get(int(seg["card_col"]), set())
+                if ncard not in seg_cards:
+                    continue
+                if card not in card_totals_by_seg[i]:
+                    card_totals_by_seg[i][card] = [0.0, 0.0]
+                card_totals_by_seg[i][card][0] += fuel_sum
+                card_totals_by_seg[i][card][1] += discount_sum
+                assigned_entry_idx.add(idx)
+                placed = True
+                break
+            if not placed:
+                if card not in unmatched_by_date:
+                    unmatched_by_date[card] = [0.0, 0.0]
+                unmatched_by_date[card][0] += fuel_sum
+                unmatched_by_date[card][1] += discount_sum
+                assigned_entry_idx.add(idx)
+
+        for i, seg in enumerate(segments):
+            totals = card_totals_by_seg.get(i) or {}
+            if not totals:
+                continue
+            totals_tuple = {k: (v[0], v[1]) for k, v in totals.items()}
+            _, _, _, missing_cards = sheet_service.update_fuel_toll_expenses(
+                sheet_name,
+                totals_tuple,
+                fuel_col=seg["fuel_col"],
+                discount_col=seg["discount_col"],
+                card_col=seg["card_col"],
+                company=company,
+            )
+            missing_set = set(str(x) for x in (missing_cards or []))
+            for card, (fuel_sum, discount_sum) in totals_tuple.items():
+                status = "TOPILMADI" if str(card) in missing_set else "TOPILDI"
+                report_rows.append(
+                    {
+                        "Sheet": sheet_name,
+                        "Week": seg["label"],
+                        "Card": str(card),
+                        "FuelSum": fuel_sum,
+                        "DiscountSum": discount_sum,
+                        "Status": status,
+                        "Izoh": "Card topildi" if status == "TOPILDI" else "Bu haftada card topilmadi",
+                    }
+                )
+
+    # Exceldagi ko'ringan cardlar ichidan reportga tushmaganlari ham albatta ko'rsatiladi.
+    for raw_card in fuel_all_cards:
+        c = str(raw_card).strip()
+        if not c:
+            continue
+        if c not in card_totals_all:
+            card_totals_all[c] = [0.0, 0.0]
+
+    reported_cards = set()
+    for row in report_rows:
+        cval = row.get("Card")
+        if cval is not None and str(cval).strip():
+            reported_cards.add(str(cval).strip())
+
+    for card, (fuel_sum, discount_sum) in unmatched_by_date.items():
+        if str(card).strip() in reported_cards:
+            continue
+        report_rows.append(
+            {
+                "Sheet": "(topilmadi)",
+                "Week": "-",
+                "Card": str(card),
+                "FuelSum": fuel_sum,
+                "DiscountSum": discount_sum,
+                "Status": "TOPILMADI",
+                "Izoh": "Excel sanasi tanlangan listlardagi hafta bilan mos emas",
+            }
+        )
+
+    for card, (fuel_sum, discount_sum) in card_totals_all.items():
+        if str(card).strip() in reported_cards:
+            continue
+        report_rows.append(
+            {
+                "Sheet": "(topilmadi)",
+                "Week": "-",
+                "Card": str(card),
+                "FuelSum": fuel_sum,
+                "DiscountSum": discount_sum,
+                "Status": "TOPILMADI",
+                "Izoh": "Tanlangan listlar ichida ham card topilmadi",
+            }
+        )
+
+    if not report_rows:
+        await callback.message.edit_text("❌ Tanlangan list(lar) bo'yicha mos yozuv topilmadi.")
+        await state.set_state(BotStates.Fuel)
+        return
+
+    try:
+        import os
+        import tempfile
+        import pandas as pd
+        from aiogram.types import FSInputFile
+        from openpyxl import load_workbook
+        from openpyxl.styles import PatternFill
+
+        report_df = pd.DataFrame(report_rows)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        tmp_path = tmp.name
+        tmp.close()
+        report_df.to_excel(tmp_path, index=False)
+
+        wb = load_workbook(tmp_path)
+        ws_rep = wb.active
+        status_col_idx = None
+        for c in range(1, ws_rep.max_column + 1):
+            if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
+                status_col_idx = c
+                break
+        if status_col_idx:
+            green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            for r in range(2, ws_rep.max_row + 1):
+                cell = ws_rep.cell(row=r, column=status_col_idx)
+                v = str(cell.value).strip().upper() if cell.value is not None else ""
+                if v == "TOPILDI":
+                    cell.fill = green_fill
+                elif v == "TOPILMADI":
+                    cell.fill = red_fill
+            wb.save(tmp_path)
+
+        await callback.message.answer_document(FSInputFile(tmp_path))
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    await callback.message.edit_text("✅ Fuel tekshirildi va report yuborildi.")
+    await state.set_state(BotStates.Fuel)
+
+
+@dp.callback_query(F.data.startswith("toll_scope:"), BotStates.TollSheetSelect)
+async def callback_toll_scope(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    company = data.get("selected_company") or get_company(callback.from_user.id)
+    if not company:
+        await callback.message.edit_text("Iltimos, /start bosing va Load tanlang.")
+        return
+
+    scope = callback.data.replace("toll_scope:", "").strip()
+    if scope == "owner_company":
+        sheet_names = data.get("toll_owner_company") or []
+    elif scope == "terminated":
+        sheet_names = data.get("toll_terminated") or []
+    else:
+        sheet_names = []
+    toll_entries = data.get("toll_entries") or []
+    if not sheet_names or not toll_entries:
+        await callback.message.edit_text("❌ Ma'lumotlar topilmadi. Qaytadan Toll fayl yuboring.")
+        await state.set_state(BotStates.Toll)
+        return
+
+    await callback.message.edit_text("⏳ Tanlangan list(lar) bo'yicha tekshirilmoqda...")
+    from services.google_sheets import get_sheet_service
+    sheet_service = get_sheet_service()
+
+    import re
+    from datetime import datetime, date
+    report_rows = []
+    assigned_entry_idx = set()
+    unmatched_by_date = {}
+
+    transponder_totals_all = {}
+    for item in toll_entries:
+        transponder = str(item.get("transponder", "")).strip()
+        if not transponder:
+            continue
+        toll_sum = float(item.get("toll", 0.0) or 0.0)
+        if transponder not in transponder_totals_all:
+            transponder_totals_all[transponder] = 0.0
+        transponder_totals_all[transponder] += toll_sum
+
+    for sheet_name in sheet_names:
+        ws = sheet_service.get_expenses_board(sheet_name, company)
+        if not ws:
+            continue
+        top_grid = ws.get("A1:Z10")
+        seg_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
+        date_matches = []
+        for r in range(min(len(top_grid), 10)):
+            row_data = top_grid[r] if r < len(top_grid) else []
+            for c in range(min(26, len(row_data))):
+                cell = row_data[c] if c < len(row_data) else None
+                if cell is None:
+                    continue
+                cell_s = str(cell)
+                m2 = seg_re.search(cell_s)
+                if not m2:
+                    continue
+                year_m = re.search(r"(\d{4})", cell_s)
+                year_cell = int(year_m.group(1)) if year_m else datetime.now().year
+                sm, sd = map(int, m2.group(1).split("."))
+                em, ed = map(int, m2.group(2).split("."))
+                s_date = date(year_cell, sm, sd)
+                e_year = year_cell + 1 if (em, ed) < (sm, sd) else year_cell
+                e_date = date(e_year, em, ed)
+                date_matches.append((s_date, e_date, c + 1))
+        uniq = {}
+        for s_date, e_date, c in date_matches:
+            uniq[(s_date, e_date, c)] = True
+        date_matches = sorted(list(uniq.keys()), key=lambda x: x[2])
+
+        transponder_cols = []
+        toll_cols = []
+        for r in range(min(10, len(top_grid))):
+            row_data = top_grid[r] if r < len(top_grid) else []
+            for c in range(min(26, len(row_data))):
+                cell = row_data[c] if c < len(row_data) else None
+                if cell is None:
+                    continue
+                txt = str(cell).strip().lower()
+                if not txt:
+                    continue
+                if "transponder" in txt or "pptag" in txt:
+                    transponder_cols.append(c + 1)
+                if "toll" in txt and ("exp" in txt or "amount" in txt):
+                    toll_cols.append(c + 1)
+        if not toll_cols:
+            toll_cols = [7]
+        if not transponder_cols:
+            transponder_cols = [4, 3]
+
+        segments = []
+        if date_matches:
+            for i in range(len(date_matches)):
+                s_date, e_date, start_col = date_matches[i]
+                end_col = (date_matches[i + 1][2] - 1) if i + 1 < len(date_matches) else 26
+                t_col = next((tc for tc in toll_cols if start_col <= tc <= end_col), toll_cols[0])
+                tr_col = next((tc for tc in transponder_cols if start_col <= tc <= end_col), transponder_cols[0])
+                segments.append(
+                    {
+                        "label": f"{s_date.strftime('%m.%d')}-{e_date.strftime('%m.%d')}",
+                        "start_date": s_date,
+                        "end_date": e_date,
+                        "transponder_col": tr_col,
+                        "toll_col": t_col,
+                    }
+                )
+        else:
+            continue
+
+        seg_trans_sets = {}
+        sheet_trans_set = set()
+        unique_trans_cols = sorted({int(seg["transponder_col"]) for seg in segments})
+        for tc in unique_trans_cols:
+            try:
+                raw_trans = ws.col_values(tc)
+            except Exception:
+                raw_trans = []
+            tset = set()
+            for v in raw_trans[3:]:
+                nv = sheet_service._normalize_load_num(v)
+                if nv:
+                    tset.add(nv)
+            seg_trans_sets[tc] = tset
+            sheet_trans_set.update(tset)
+
+        totals_by_seg = {i: {} for i in range(len(segments))}
+        for idx, item in enumerate(toll_entries):
+            if idx in assigned_entry_idx:
+                continue
+            transponder = str(item.get("transponder", "")).strip()
+            if not transponder:
+                continue
+            ntr = sheet_service._normalize_load_num(transponder)
+            if not ntr or ntr not in sheet_trans_set:
+                continue
+            try:
+                item_date = datetime.fromisoformat(item["date"]).date()
+            except Exception:
+                continue
+            toll_sum = float(item.get("toll", 0.0) or 0.0)
+            placed = False
+            for i, seg in enumerate(segments):
+                if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
+                    continue
+                seg_trans = seg_trans_sets.get(int(seg["transponder_col"]), set())
+                if ntr not in seg_trans:
+                    continue
+                if transponder not in totals_by_seg[i]:
+                    totals_by_seg[i][transponder] = 0.0
+                totals_by_seg[i][transponder] += toll_sum
+                assigned_entry_idx.add(idx)
+                placed = True
+                break
+            if not placed:
+                if transponder not in unmatched_by_date:
+                    unmatched_by_date[transponder] = 0.0
+                unmatched_by_date[transponder] += toll_sum
+                assigned_entry_idx.add(idx)
+
+        for i, seg in enumerate(segments):
+            totals = totals_by_seg.get(i) or {}
+            if not totals:
+                continue
+            _, _, _, missing = sheet_service.update_toll_expenses(
+                sheet_name,
+                totals,
+                toll_col=seg["toll_col"],
+                transponder_col=seg["transponder_col"],
+                company=company,
+            )
+            missing_set = set(str(x) for x in (missing or []))
+            for transponder, toll_sum in totals.items():
+                status = "TOPILMADI" if str(transponder) in missing_set else "TOPILDI"
+                report_rows.append(
+                    {
+                        "Sheet": sheet_name,
+                        "Week": seg["label"],
+                        "Transponder": str(transponder),
+                        "TollSum": toll_sum,
+                        "Status": status,
+                        "Izoh": "Transponder topildi" if status == "TOPILDI" else "Bu haftada transponder topilmadi",
+                    }
+                )
+
+    reported_trans = set()
+    for row in report_rows:
+        t = row.get("Transponder")
+        if t is not None and str(t).strip():
+            reported_trans.add(str(t).strip())
+
+    for tr, toll_sum in unmatched_by_date.items():
+        if str(tr).strip() in reported_trans:
+            continue
+        report_rows.append(
+            {
+                "Sheet": "(topilmadi)",
+                "Week": "-",
+                "Transponder": str(tr),
+                "TollSum": toll_sum,
+                "Status": "TOPILMADI",
+                "Izoh": "Excel sanasi tanlangan listlardagi hafta bilan mos emas",
+            }
+        )
+
+    for tr, toll_sum in transponder_totals_all.items():
+        if str(tr).strip() in reported_trans:
+            continue
+        report_rows.append(
+            {
+                "Sheet": "(topilmadi)",
+                "Week": "-",
+                "Transponder": str(tr),
+                "TollSum": toll_sum,
+                "Status": "TOPILMADI",
+                "Izoh": "Tanlangan listlar ichida ham transponder topilmadi",
+            }
+        )
+
+    if not report_rows:
+        await callback.message.edit_text("❌ Tanlangan list(lar) bo'yicha mos yozuv topilmadi.")
+        await state.set_state(BotStates.Toll)
+        return
+
+    try:
+        import os
+        import tempfile
+        import pandas as pd
+        from aiogram.types import FSInputFile
+        from openpyxl import load_workbook
+        from openpyxl.styles import PatternFill
+
+        report_df = pd.DataFrame(report_rows)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        tmp_path = tmp.name
+        tmp.close()
+        report_df.to_excel(tmp_path, index=False)
+
+        wb = load_workbook(tmp_path)
+        ws_rep = wb.active
+        status_col_idx = None
+        for c in range(1, ws_rep.max_column + 1):
+            if str(ws_rep.cell(row=1, column=c).value).strip() == "Status":
+                status_col_idx = c
+                break
+        if status_col_idx:
+            green_fill = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
+            red_fill = PatternFill(start_color="C62828", end_color="C62828", fill_type="solid")
+            for r in range(2, ws_rep.max_row + 1):
+                cell = ws_rep.cell(row=r, column=status_col_idx)
+                v = str(cell.value).strip().upper() if cell.value is not None else ""
+                if v == "TOPILDI":
+                    cell.fill = green_fill
+                elif v == "TOPILMADI":
+                    cell.fill = red_fill
+            wb.save(tmp_path)
+
+        await callback.message.answer_document(FSInputFile(tmp_path))
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    await callback.message.edit_text("✅ Toll tekshirildi va report yuborildi.")
+    await state.set_state(BotStates.Toll)
 
 
 @dp.callback_query(F.data.startswith("fuel_sheet:"), BotStates.FuelSheetSelect)

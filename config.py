@@ -32,6 +32,9 @@ def _get_company_keys():
 
 COMPANY_SHEET_KEYS = _get_company_keys()
 
+# Load board: Company Driver settlement PDF dagi Rate (Gross) bilan solishtiriladigan ustun (1=A, 12=L, ...)
+LOAD_BOARD_RATE_COL = int(os.getenv("LOAD_BOARD_RATE_COL", "12"))
+
 # Database Config (DATABASE_URL yoki alohida parametrlar)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL and all([os.getenv("DB_USER"), os.getenv("DB_PASS"), os.getenv("DB_NAME")]):

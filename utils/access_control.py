@@ -41,6 +41,20 @@ def is_admin(user_id: int, admin_ids: list = None) -> bool:
     return str(user_id) in [str(a).strip() for a in admin_ids if a]
 
 
+def is_super_admin(user_id: int) -> bool:
+    """
+    Super admin: .env dagi ADMIN_IDS ro'yxatidagi birinchi ID.
+    Faqat shu foydalanuvchi maxsus bo'limlarni ko'ra oladi.
+    """
+    try:
+        env_admins = getattr(__import__("config"), "ADMINS", []) or []
+        if not env_admins:
+            return False
+        return str(user_id).strip() == str(env_admins[0]).strip()
+    except Exception:
+        return False
+
+
 def grant_admin(user_id: int, username: str = "", full_name: str = "") -> bool:
     cur = _cursor()
     if not cur:

@@ -14,7 +14,7 @@ import re
 _sheet_service_instance = None
 _sheet_names_cache: dict[tuple, list] = {}
 _sheet_names_cache_time: dict[tuple, float] = {}
-CACHE_SEC = 90  # List nomlari 90 sekund cache
+CACHE_SEC = 180  # List nomlari cache (API tejash)
 
 def get_sheet_service():
     """Lazy init - faqat kerak bo'lganda yaratiladi. 429 da retry."""
@@ -40,7 +40,19 @@ class GoogleSheetService:
         self._expenses_spreadsheets: dict[str, object] = {}
 
     def _get_company_or_default(self, company):
-        return company if company and company in config.COMPANY_SHEET_KEYS else config.COMPANY_NAMES[0]
+        if not company:
+            return config.COMPANY_NAMES[0]
+        raw = str(company).strip()
+        if raw in config.COMPANY_SHEET_KEYS:
+            return raw
+
+        # Kichik/katta harf yoki ortiqcha probel bo'lsa ham mos kompaniyani topamiz.
+        norm = re.sub(r"\s+", " ", raw).strip().lower()
+        for name in config.COMPANY_SHEET_KEYS.keys():
+            if re.sub(r"\s+", " ", str(name)).strip().lower() == norm:
+                return name
+
+        return config.COMPANY_NAMES[0]
 
     def _get_load_spreadsheet(self, company=None):
         company = self._get_company_or_default(company)
@@ -76,14 +88,17 @@ class GoogleSheetService:
                         raise
         return self._expenses_spreadsheets.get(company)
 
-    def _retry_on_429(self, func, *args, max_retries=2, **kwargs):
-        """429 da avtomatik retry (tezroq backoff)."""
+    def _retry_on_429(self, func, *args, max_retries=8, **kwargs):
+        """429 / quota da retry — eksponensial kutish (max ~60s)."""
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
             except GspreadAPIError as e:
-                if "429" in str(e) and attempt < max_retries - 1:
-                    wait = 0.8 * (attempt + 1)
+                err = str(e)
+                if (
+                    "429" in err or "Quota" in err or "quota" in err
+                ) and attempt < max_retries - 1:
+                    wait = min(60.0, 2.0 ** (attempt + 1))
                     time.sleep(wait)
                     continue
                 raise
@@ -210,24 +225,60 @@ class GoogleSheetService:
 
         return s
 
+    @staticmethod
+    def _a1_column(col_num: int) -> str:
+        """1-based ustun raqami -> A1 harfi (1=A, 27=AA)."""
+        n = col_num
+        letters = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            letters = chr(65 + r) + letters
+        return letters
+
+    def get_load_row_index(
+        self, sheet_name, company=None, start_row=17, load_cols=(4, 5, 7)
+    ):
+        """
+        Bitta batch_get bilan LOAD ustunlarini o'qiydi; normalize kalit -> qator.
+        Ko'p trip tekshiruvida API tejash uchun.
+        """
+        sheet = self.get_load_board(sheet_name, company)
+        if not sheet:
+            return {}
+        try:
+            col_map = self._get_columns_from_start(
+                sheet, list(load_cols), start_row=start_row
+            )
+        except Exception as e:
+            print(f"get_load_row_index: {e}")
+            return {}
+        index = {}
+        for col in load_cols:
+            for i, val in enumerate(col_map.get(col, [])):
+                key = self._normalize_load_num(val)
+                if not key or str(val).strip().lower() == "load #":
+                    continue
+                if key not in index:
+                    index[key] = start_row + i
+        return index
+
     def find_load_row(self, load_number, sheet_name, load_col=None, company=None):
         """
         LOAD # ustuni bo'yicha Load Numberni qidiradi.
-        Odatiy: D=4, agar topilmasa E=5 sinash. 17-qatordan boshlab.
+        D, keyin E, keyin G. Bitta batch_get — alohida col_values emas.
         """
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return None
         try:
-            for col in (load_col,) if load_col else (4, 5, 7):  # D, E, G - LOAD #
-                if col is None:
-                    continue
-                load_numbers = sheet.col_values(col)
-                start_index = 16
-                target = self._normalize_load_num(load_number)
-                for i in range(start_index, len(load_numbers)):
-                    if i < len(load_numbers) and self._normalize_load_num(load_numbers[i]) == target:
-                        return i + 1
+            target = self._normalize_load_num(load_number)
+            cols = tuple(c for c in ((load_col,) if load_col else (4, 5, 7)) if c is not None)
+            col_map = self._get_columns_from_start(sheet, list(cols), start_row=17)
+            for col in cols:
+                load_numbers = col_map.get(col, [])
+                for i, val in enumerate(load_numbers):
+                    if self._normalize_load_num(val) == target:
+                        return 17 + i
             return None
         except Exception as e:
             print(f"Error finding load: {e}")
@@ -837,7 +888,7 @@ class GoogleSheetService:
         try:
             return {
                 'load_number': sheet.cell(row, 4).value,
-                'driver': sheet.cell(row, 2).value,
+                'driver': self._driver_name_for_load_row(sheet, row),
                 'pu_date': sheet.cell(row, 5).value,
                 'invoiced': sheet.cell(row, 16).value,
                 'broker_paid': sheet.cell(row, 18).value,
@@ -944,5 +995,124 @@ class GoogleSheetService:
             }
         except Exception as e:
             print(f"Error getting load details: {e}")
+            return None
+
+    def _driver_name_for_load_row(
+        self,
+        sheet,
+        row: int,
+        data_start_row: int = 17,
+        b_cell_value=None,
+    ) -> str:
+        """
+        Haydovchi ismi faqat B ustunidan (DRIVER NAME). Merged B: bitta batch_get yoki b_cell_value.
+        """
+        skip = {
+            "load #",
+            "load",
+            "driver",
+            "driver name",
+            "type",
+            "date",
+            "origin",
+            "destination",
+            "status",
+            "mileage",
+            "rpm",
+            "rate",
+            "broker",
+            "c/d",
+            "o/o",
+        }
+
+        def clean(v):
+            if v is None:
+                return ""
+            return str(v).replace("\xa0", " ").strip()
+
+        def looks_ok(name: str) -> bool:
+            if len(name) < 3:
+                return False
+            low = name.lower()
+            if low in skip or len(name) > 120:
+                return False
+            if re.match(r"^[\d\s$.,\-–—%/]+$", name):
+                return False
+            return True
+
+        try:
+            if b_cell_value is not None:
+                b = clean(b_cell_value)
+            else:
+                b = clean(sheet.cell(row, 2).value)
+            if looks_ok(b):
+                return b
+        except Exception:
+            pass
+
+        if row <= data_start_row:
+            return ""
+        try:
+            rng = f"B{data_start_row}:B{row - 1}"
+            block = self._retry_on_429(sheet.batch_get, [rng])
+            if not block or not block[0]:
+                return ""
+            vals = [row[0] if row else "" for row in block[0]]
+            for b in reversed(vals):
+                b = clean(b)
+                if looks_ok(b):
+                    return b
+        except Exception:
+            pass
+        return ""
+
+    def get_settlement_compare_fields(self, row, sheet_name, company=None):
+        """
+        Company Driver PDF solishtirish: haydovchi faqat B (DRIVER NAME, merged bo'lsa yuqoriga), LOAD # (D), RATE.
+        """
+        sheet = self.get_load_board(sheet_name, company)
+        if not sheet:
+            return None
+
+        def clean_amount(val):
+            if not val:
+                return 0.0
+            if isinstance(val, (int, float)):
+                return float(val)
+            val = str(val).replace("$", "").replace(",", "").strip()
+            try:
+                return float(val)
+            except ValueError:
+                return 0.0
+
+        try:
+            rate_col = max(1, int(getattr(config, "LOAD_BOARD_RATE_COL", 12)))
+            rl = self._a1_column(rate_col)
+            cells = self._retry_on_429(
+                sheet.batch_get,
+                [f"B{row}", f"D{row}", f"{rl}{row}"],
+            )
+
+            def _bgv(i: int):
+                if i >= len(cells) or not cells[i]:
+                    return None
+                r0 = cells[i][0]
+                if not r0:
+                    return None
+                return r0[0] if len(r0) > 0 else None
+
+            b_here = _bgv(0)
+            load_number = _bgv(1)
+            rate_val = _bgv(2)
+            driver = self._driver_name_for_load_row(
+                sheet, row, b_cell_value=b_here
+            )
+            return {
+                "driver": driver,
+                "load_number": load_number,
+                "rate": clean_amount(rate_val),
+            }
+        except Exception as e:
+            print(f"get_settlement_compare_fields error: {e}")
             return None
 
