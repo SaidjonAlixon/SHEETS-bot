@@ -225,6 +225,33 @@ class GoogleSheetService:
 
         return s
 
+    def split_load_cell_tokens(self, val):
+        """
+        Sheet D/E/G katakda bir nechta LOAD: '447426 // 447423', 'A | B' kabi.
+        Har bir segment alohida _normalize_load_num qilinadi (butun qatorni
+        birlashtirib yubormaslik uchun).
+        """
+        if val is None:
+            return []
+        s = str(val).strip()
+        if not s or s.lower() in ("load #", "load", "-", "—"):
+            return []
+        # // yoki || yoki bir qatorli | (masalan M1 // M2)
+        parts = re.split(r"\s*(?://|\|\|)\s*|\s*\|\s*", s)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) <= 1 and "," in s:
+            low = s.lower()
+            if "/mi" not in low and not re.search(r"\d+\.\d{2}\s*$", s):
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for p in parts:
+            k = self._normalize_load_num(p)
+            if k and k not in seen:
+                seen.add(k)
+                tokens.append(k)
+        return tokens
+
     @staticmethod
     def _a1_column(col_num: int) -> str:
         """1-based ustun raqami -> A1 harfi (1=A, 27=AA)."""
@@ -255,11 +282,14 @@ class GoogleSheetService:
         index = {}
         for col in load_cols:
             for i, val in enumerate(col_map.get(col, [])):
-                key = self._normalize_load_num(val)
-                if not key or str(val).strip().lower() == "load #":
+                if str(val).strip().lower() == "load #":
                     continue
-                if key not in index:
-                    index[key] = start_row + i
+                row_num = start_row + i
+                for key in self.split_load_cell_tokens(val):
+                    if not key:
+                        continue
+                    if key not in index:
+                        index[key] = row_num
         return index
 
     def find_load_row(self, load_number, sheet_name, load_col=None, company=None):
@@ -277,8 +307,12 @@ class GoogleSheetService:
             for col in cols:
                 load_numbers = col_map.get(col, [])
                 for i, val in enumerate(load_numbers):
-                    if self._normalize_load_num(val) == target:
-                        return 17 + i
+                    toks = self.split_load_cell_tokens(val)
+                    if not toks:
+                        toks = [self._normalize_load_num(val)]
+                    for tok in toks:
+                        if tok and tok == target:
+                            return 17 + i
             return None
         except Exception as e:
             print(f"Error finding load: {e}")
@@ -1115,4 +1149,104 @@ class GoogleSheetService:
         except Exception as e:
             print(f"get_settlement_compare_fields error: {e}")
             return None
+
+    @staticmethod
+    def _driver_display_names_match(pdf_driver: str, sheet_driver: str) -> bool:
+        """statement._drivers_match bilan bir xil mantiq (import tsiklini oldini olish uchun)."""
+        if not pdf_driver or not sheet_driver:
+            return False
+        p = re.sub(r"\s+", " ", str(pdf_driver).strip().lower())
+        s = re.sub(r"\s+", " ", str(sheet_driver).strip().lower())
+        if not p or not s:
+            return False
+        if p == s or p in s or s in p:
+            return True
+        wp, ws = set(p.split()), set(s.split())
+        return len(wp & ws) >= 2
+
+    def find_driver_rows_on_load_sheet(
+        self,
+        sheet_name: str,
+        driver_name: str,
+        company=None,
+        start_row: int = 17,
+        max_rows: int = 800,
+    ):
+        """
+        Haftalik Load Board sheetida B ustunidan (merged) haydovchini qidiradi.
+        Qaytaradi: None yoki {
+          first_row, matched_rows, sheet_name, last_resolved_name
+        }
+        """
+        if not sheet_name or not str(driver_name or "").strip():
+            return None
+        sheet = self.get_load_board(sheet_name, company)
+        if not sheet:
+            return None
+
+        skip = {
+            "load #",
+            "load",
+            "driver",
+            "driver name",
+            "type",
+            "date",
+            "origin",
+            "destination",
+            "status",
+            "mileage",
+            "rpm",
+            "rate",
+            "broker",
+            "c/d",
+            "o/o",
+            "totals:",
+            "totals",
+        }
+
+        def clean(v):
+            if v is None:
+                return ""
+            return str(v).replace("\xa0", " ").strip()
+
+        def looks_ok(name: str) -> bool:
+            if len(name) < 3:
+                return False
+            low = name.lower()
+            if low in skip or len(name) > 120:
+                return False
+            if re.match(r"^[\d\s$.,\-–—%/]+$", name):
+                return False
+            return True
+
+        end_row = start_row + max_rows - 1
+        try:
+            block = self._retry_on_429(sheet.batch_get, [f"B{start_row}:B{end_row}"])
+        except Exception as e:
+            print(f"find_driver_rows_on_load_sheet batch_get: {e}")
+            return None
+        if not block or not block[0]:
+            return None
+
+        rows_flat = block[0]
+        last_resolved = ""
+        matched: list[int] = []
+
+        for i, cell in enumerate(rows_flat):
+            raw = cell[0] if cell and len(cell) > 0 else ""
+            b = clean(raw)
+            if looks_ok(b):
+                last_resolved = b
+            row_num = start_row + i
+            if last_resolved and self._driver_display_names_match(driver_name, last_resolved):
+                matched.append(row_num)
+
+        if not matched:
+            return None
+        return {
+            "first_row": matched[0],
+            "matched_rows": matched,
+            "sheet_name": sheet_name,
+            "last_resolved_name": last_resolved,
+        }
 

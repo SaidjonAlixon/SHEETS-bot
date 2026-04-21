@@ -1,9 +1,10 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from utils.access_control import is_admin
 from utils.access_control import is_super_admin
+from utils.access_control import has_access
 
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    """Statement Check — faqat super admin; Sozlamalar adminlar uchun."""
+    """Statement Check — botga ruxsati bor hamma; Sozlamalar adminlar uchun."""
     base = [
         [
             KeyboardButton(text="📄 Factoring Payments"),
@@ -14,7 +15,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🛣️ Toll Expenses"),
         ],
     ]
-    if is_super_admin(user_id):
+    if has_access(user_id):
         base.append([KeyboardButton(text="📊 Statement Check")])
     if is_admin(user_id):
         base.append([KeyboardButton(text="⚙️ Sozlamalar")])

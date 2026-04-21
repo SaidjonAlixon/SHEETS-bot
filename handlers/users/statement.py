@@ -1,5 +1,6 @@
 import os
 import re
+from collections import defaultdict
 
 import pandas as pd
 from aiogram import F, types
@@ -10,11 +11,10 @@ import config
 from keyboards.default.main_menu import get_load_select_menu, get_main_menu
 from keyboards.default.statement_menu import statement_menu
 from loader import bot, dp
-from services.company_driver_pdf import parse_company_driver_settlement_pdf
+from services.company_driver_pdf import parse_company_driver_settlement_pdf_ai
 from services.excel_parser import ExcelParser
 from services.google_sheets import get_sheet_service
 from states.bot_states import BotStates
-from utils.access_control import is_super_admin
 from utils.company_storage import get_company
 
 
@@ -42,20 +42,34 @@ def _pdf_sheet_id_match(sheet_service, pdf_tid, sheet_load_raw) -> str:
     if not pdf_tid or sheet_load_raw is None or str(sheet_load_raw).strip() == "":
         return "-"
     a = sheet_service._normalize_load_num(pdf_tid)
+    toks = sheet_service.split_load_cell_tokens(sheet_load_raw)
+    if toks:
+        return "ha" if a in toks else "yo'q"
     b = sheet_service._normalize_load_num(sheet_load_raw)
     if not a or not b:
         return "-"
     return "ha" if a == b else "yo'q"
 
 
-def _deny_if_not_super_admin(user_id: int) -> bool:
-    return not is_super_admin(user_id)
+def _pdf_trip_ids_match_sheet_cell(sheet_service, trip_ids: list, sheet_load_raw) -> bool:
+    """Bir nechta PDF load ID sheet katakidagi // bilan birlashtirilgan ro'yxat bilan to'liq mosmi."""
+    if sheet_load_raw is None or str(sheet_load_raw).strip() == "":
+        return False
+    sheet_toks = sheet_service.split_load_cell_tokens(sheet_load_raw)
+    pdf_toks = sorted(
+        sheet_service._normalize_load_num(t) for t in trip_ids if t
+    )
+    pdf_toks = [x for x in pdf_toks if x]
+    if not pdf_toks:
+        return False
+    if not sheet_toks:
+        one = sheet_service._normalize_load_num(sheet_load_raw)
+        return bool(one) and pdf_toks == [one]
+    return sorted(sheet_toks) == pdf_toks
 
 
 @dp.message(F.text == "📊 Statement Check")
 async def enter_statement(message: types.Message, state: FSMContext):
-    if _deny_if_not_super_admin(message.from_user.id):
-        return
     company = get_company(message.from_user.id)
     if not company:
         await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
@@ -91,8 +105,6 @@ async def ask_company_driver_pdf(message: types.Message, state: FSMContext):
     Statement FSM yo'qolganda ham ishlashi kerak (MemoryStorage, bot qayta ishga tushganda).
     Holat filterisiz — kompaniya (Load) tanlangan bo'lishi kerak.
     """
-    if _deny_if_not_super_admin(message.from_user.id):
-        return
     company = get_company(message.from_user.id)
     if not company:
         await message.answer(
@@ -114,24 +126,16 @@ async def ask_company_driver_pdf(message: types.Message, state: FSMContext):
 
 @dp.message(F.text.in_(_statement_fayl_yuklash_texts()), BotStates.StatementCompanyDriverPdf)
 async def ask_statement_file_from_pdf_flow(message: types.Message, state: FSMContext):
-    if _deny_if_not_super_admin(message.from_user.id):
-        await state.clear()
-        return
     await state.set_state(BotStates.Statement)
     await message.answer("Statement Excel (xlsx, xls) faylini yuboring.")
 
 
 @dp.message(F.text.in_(_statement_fayl_yuklash_texts()), BotStates.Statement)
 async def ask_statement_file(message: types.Message):
-    if _deny_if_not_super_admin(message.from_user.id):
-        return
     await message.answer("Statement Excel (xlsx, xls) faylini yuboring.")
 
 @dp.message(F.document, BotStates.Statement)
 async def handle_statement_doc(message: types.Message, state: FSMContext):
-    if _deny_if_not_super_admin(message.from_user.id):
-        await state.clear()
-        return
     company = get_company(message.from_user.id)
     if not company:
         await message.answer("Iltimos, avval Load tanlang:", reply_markup=get_load_select_menu(message.from_user.id))
@@ -293,9 +297,6 @@ async def handle_statement_doc(message: types.Message, state: FSMContext):
 
 @dp.message(F.document, BotStates.StatementCompanyDriverPdf)
 async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
-    if _deny_if_not_super_admin(message.from_user.id):
-        await state.clear()
-        return
     company = get_company(message.from_user.id)
     if not company:
         await message.answer(
@@ -321,8 +322,9 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
         file_content = await bot.download_file(file.file_path)
         content_bytes = file_content.read()
 
-        parsed = parse_company_driver_settlement_pdf(content_bytes)
+        parsed = parse_company_driver_settlement_pdf_ai(content_bytes)
         warnings = parsed.get("parse_warnings") or []
+        pdf_driver_name = (parsed.get("driver_name") or "").strip()
 
         try:
             sheet_service = get_sheet_service()
@@ -347,24 +349,92 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
         fallback_sheets = sheet_service.get_last_n_week_sheets(14, company=company)
         sheets_to_index = list(dict.fromkeys([s for s in ([primary_sheet] if primary_sheet else []) + list(fallback_sheets) if s]))
         load_index_cache: dict[str, dict] = {}
+        valid_load_keys: set[str] = set()
         for sn in sheets_to_index:
-            load_index_cache[sn] = sheet_service.get_load_row_index(sn, company=company)
+            idx = sheet_service.get_load_row_index(sn, company=company)
+            load_index_cache[sn] = idx
+            valid_load_keys.update(idx.keys())
 
         results = []
         ok_n = bad_n = miss_n = 0
+        skipped_trip_like_n = 0
+        no_trips_in_pdf = not (parsed.get("trips") or [])
+
+        if no_trips_in_pdf:
+            find_res = None
+            if pdf_driver_name:
+                if primary_sheet:
+                    find_res = sheet_service.find_driver_rows_on_load_sheet(
+                        primary_sheet, pdf_driver_name, company=company
+                    )
+                if not find_res:
+                    for sn in fallback_sheets:
+                        if sn == primary_sheet:
+                            continue
+                        find_res = sheet_service.find_driver_rows_on_load_sheet(
+                            sn, pdf_driver_name, company=company
+                        )
+                        if find_res:
+                            break
+
+            sn_no = (find_res or {}).get("sheet_name") or primary_sheet or (
+                fallback_sheets[0] if fallback_sheets else "-"
+            )
+            first_r = (find_res or {}).get("first_row")
+            matched_n = len((find_res or {}).get("matched_rows") or [])
+            if first_r:
+                row_txt = str(first_r)
+                if matched_n > 1:
+                    row_txt = f"{first_r} (blokda jami {matched_n} ta qator)"
+            else:
+                row_txt = "-"
+            sheet_drv = (find_res or {}).get("last_resolved_name") or "-"
+            izoh = (
+                "Bu driver ishlamagan — PDFda trip/load ID yo'q (settlement bo'yicha)."
+            )
+            if find_res:
+                izoh += f" Sheetda haydovchi topildi: {sheet_drv}."
+            else:
+                if pdf_driver_name:
+                    izoh += " Sheetda shu ism bilan mos qator topilmadi."
+                else:
+                    izoh += " PDFdan haydovchi ismi aniqlanmadi."
+
+            results.append(
+                {
+                    "PDF Load ID": "-",
+                    "PDF Driver": pdf_driver_name or "-",
+                    "PDF Rate (Gross)": None,
+                    "Sheet List": sn_no,
+                    "Sheet Row": row_txt,
+                    "Sheet Driver": sheet_drv,
+                    "Sheet Load ID": "-",
+                    f"Sheet Rate (col {config.LOAD_BOARD_RATE_COL})": "-",
+                    "ID mos": "-",
+                    "Rate mos": "-",
+                    "Driver mos": "ha" if find_res else "yo'q",
+                    "Natija": "TRIP YO'Q",
+                    "Moslik": "📄",
+                    "Mos kelmagan joy": izoh,
+                }
+            )
+
+        grouped: dict[tuple[str, int], list[dict]] = defaultdict(list)
+        orphan_trips: list[dict] = []
 
         for trip in parsed.get("trips") or []:
             tid = trip.get("trip_id")
-            pdf_rate = trip.get("rate_gross")
+            key = sheet_service._normalize_load_num(tid) if tid else ""
+            if key and valid_load_keys and key not in valid_load_keys:
+                skipped_trip_like_n += 1
+                continue
+
             row_num = None
             sn = None
-            key = sheet_service._normalize_load_num(tid) if tid else ""
-
             if primary_sheet and key:
                 idx = load_index_cache.get(primary_sheet) or {}
                 if key in idx:
                     row_num, sn = idx[key], primary_sheet
-
             if not row_num and key:
                 for fb in fallback_sheets:
                     idx = load_index_cache.get(fb) or {}
@@ -372,56 +442,159 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
                         row_num, sn = idx[key], fb
                         break
 
-            sheet_load = ""
-            sheet_rate = None
-            rate_ok = False
-            natija = ""
-            sabab = ""
-
-            if not sn or not row_num:
-                natija = "MOS KELMADI"
-                miss_n += 1
-                sabab = "LOAD ID sheetda topilmadi"
+            if sn and row_num:
+                grouped[(sn, row_num)].append(trip)
             else:
-                fields = sheet_service.get_settlement_compare_fields(row_num, sn, company=company)
-                if not fields:
-                    natija = "MOS KELMADI"
-                    bad_n += 1
-                    sabab = "Sheet qatori o'qilmadi"
-                else:
-                    sheet_load = fields.get("load_number")
-                    sheet_rate = fields.get("rate")
-                    try:
-                        rate_ok = abs(float(sheet_rate or 0) - float(pdf_rate or 0)) < 0.02
-                    except (TypeError, ValueError):
-                        rate_ok = False
+                orphan_trips.append(trip)
 
-                    id_mos = _pdf_sheet_id_match(sheet_service, tid, sheet_load) == "ha"
-                    if id_mos and rate_ok:
-                        natija = "MOS KELDI"
-                        ok_n += 1
-                    else:
-                        natija = "MOS KELMADI"
-                        bad_n += 1
-                        bits = []
-                        if not id_mos:
-                            bits.append("LOAD ID mos emas")
-                        if not rate_ok:
-                            bits.append("RATE mos emas")
-                        sabab = ", ".join(bits)
-
+        def _append_one_result(
+            tid_display,
+            pdf_rate_display,
+            sum_pdf_rates,
+            sn,
+            row_num,
+            sheet_load,
+            sheet_rate,
+            sheet_driver,
+            id_mos_bool,
+            rate_ok_bool,
+            driver_ok_bool,
+            natija,
+            sabab,
+        ):
             results.append(
                 {
-                    "PDF Load ID": tid or "-",
-                    "PDF Rate (Gross)": pdf_rate,
+                    "PDF Load ID": tid_display,
+                    "PDF Driver": pdf_driver_name or "-",
+                    "PDF Rate (Gross)": pdf_rate_display,
+                    "PDF Rate (jami)": sum_pdf_rates,
                     "Sheet List": sn or "(topilmadi)",
                     "Sheet Row": row_num or "-",
+                    "Sheet Driver": sheet_driver if row_num else "-",
                     "Sheet Load ID": sheet_load if row_num else "-",
                     f"Sheet Rate (col {config.LOAD_BOARD_RATE_COL})": sheet_rate if row_num else "-",
+                    "ID mos": "ha" if id_mos_bool else "yo'q",
+                    "Rate mos": "ha" if rate_ok_bool else "yo'q",
+                    "Driver mos": "ha" if driver_ok_bool else "yo'q",
                     "Natija": natija,
                     "Moslik": "✅" if natija == "MOS KELDI" else "❌",
                     "Mos kelmagan joy": sabab or "-",
                 }
+            )
+
+        for (sn, row_num), trip_list in grouped.items():
+            tids = [t.get("trip_id") for t in trip_list if t.get("trip_id")]
+            rates = []
+            for t in trip_list:
+                try:
+                    rates.append(float(t.get("rate_gross") or 0))
+                except (TypeError, ValueError):
+                    rates.append(0.0)
+            sum_pdf = sum(rates)
+            parts = []
+            for t in trip_list:
+                tid = t.get("trip_id") or "-"
+                r = t.get("rate_gross")
+                parts.append(f"{tid} ({r})")
+            tid_display = " + ".join(parts) if len(trip_list) > 1 else (tids[0] if tids else "-")
+            pdf_rate_display = (
+                " + ".join(str(t.get("rate_gross")) for t in trip_list)
+                if len(trip_list) > 1
+                else trip_list[0].get("rate_gross")
+            )
+
+            fields = sheet_service.get_settlement_compare_fields(row_num, sn, company=company)
+            if not fields:
+                bad_n += 1
+                _append_one_result(
+                    tid_display,
+                    pdf_rate_display,
+                    sum_pdf,
+                    sn,
+                    row_num,
+                    "",
+                    None,
+                    "",
+                    False,
+                    False,
+                    False,
+                    "MOS KELMADI",
+                    "Sheet qatori o'qilmadi",
+                )
+                continue
+
+            sheet_load = fields.get("load_number")
+            sheet_rate = fields.get("rate")
+            sheet_driver = (fields.get("driver") or "").strip()
+            try:
+                rate_ok = abs(float(sheet_rate or 0) - float(sum_pdf)) < 0.02
+            except (TypeError, ValueError):
+                rate_ok = False
+
+            id_mos = _pdf_trip_ids_match_sheet_cell(sheet_service, tids, sheet_load)
+            if pdf_driver_name:
+                driver_ok = _drivers_match(pdf_driver_name, sheet_driver)
+            else:
+                driver_ok = True
+
+            if id_mos and rate_ok and driver_ok:
+                natija = "MOS KELDI"
+                ok_n += 1
+                sabab = ""
+            else:
+                natija = "MOS KELMADI"
+                bad_n += 1
+                bits = []
+                if not id_mos:
+                    bits.append("LOAD ID mos emas")
+                if not rate_ok:
+                    bits.append(
+                        f"RATE mos emas (PDF jami {sum_pdf} vs Sheet {sheet_rate})"
+                    )
+                if not driver_ok:
+                    bits.append("Driver mos emas")
+                sabab = ", ".join(bits)
+
+            _append_one_result(
+                tid_display,
+                pdf_rate_display,
+                sum_pdf,
+                sn,
+                row_num,
+                sheet_load,
+                sheet_rate,
+                sheet_driver,
+                id_mos,
+                rate_ok,
+                driver_ok,
+                natija,
+                sabab,
+            )
+
+        for trip in orphan_trips:
+            tid = trip.get("trip_id")
+            pdf_rate = trip.get("rate_gross")
+            natija = "MOS KELMADI"
+            miss_n += 1
+            sabab = "LOAD ID sheetda topilmadi"
+            try:
+                sum_or = float(pdf_rate or 0)
+            except (TypeError, ValueError):
+                sum_or = 0.0
+            _append_one_result(
+                tid or "-",
+                pdf_rate,
+                sum_or,
+                None,
+                None,
+                "",
+                None,
+                "",
+                False,
+                False,
+                False,
+                natija,
+                sabab,
             )
 
         detail = pd.DataFrame(results)
@@ -434,23 +607,37 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
             detail.to_excel(writer, sheet_name="Solishtirish", index=False)
             ws = writer.book["Solishtirish"]
             green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            # Natija ustuni G (header bilan 1-qator, data 2-qatordan)
-            for r in range(2, ws.max_row + 1):
-                natija_val = str(ws[f"G{r}"].value or "").strip().upper()
-                if natija_val == "MOS KELDI":
-                    for c in range(1, ws.max_column + 1):
-                        ws.cell(row=r, column=c).fill = green_fill
+            natija_col = None
+            for c in range(1, ws.max_column + 1):
+                if str(ws.cell(row=1, column=c).value or "").strip() == "Natija":
+                    natija_col = c
+                    break
+            if natija_col:
+                for r in range(2, ws.max_row + 1):
+                    natija_val = str(ws.cell(row=r, column=natija_col).value or "").strip().upper()
+                    if natija_val == "MOS KELDI":
+                        for c in range(1, ws.max_column + 1):
+                            ws.cell(row=r, column=c).fill = green_fill
 
         warn_text = "\n".join(f"⚠️ {w}" for w in warnings) if warnings else ""
         if warn_text:
             await message.answer(warn_text)
+
+        no_trip_line = ""
+        if no_trips_in_pdf:
+            no_trip_line = (
+                f"\n📄 <b>PDFda trip/load yo'q.</b> Excelda haydovchi joyi va "
+                f"<i>ishlamagan</i> izohi qatorida.\n"
+            )
 
         await message.answer(
             f"🏁 Tekshiruv tugadi — <b>{company}</b> Load Board.\n"
             f"✅ To'g'ri: {ok_n}\n"
             f"❌ Noto'g'ri: {bad_n}\n"
             f"❓ Topilmadi: {miss_n}\n"
-            f"📋 Asosiy list: {primary_sheet or '-'}",
+            f"🚫 Trip-no sifatida chiqarib tashlandi: {skipped_trip_like_n}\n"
+            f"📋 Asosiy list: {primary_sheet or '-'}"
+            f"{no_trip_line}",
             parse_mode="HTML",
         )
         await message.answer_document(types.FSInputFile(report_name))

@@ -5,11 +5,15 @@ Turli PDF generatorlar (TurboTax, payroll va h.k.) uchun bir nechta ajratish str
 from __future__ import annotations
 
 import io
+import json
 import re
+import urllib.error
+import urllib.request
 from datetime import date
 from typing import Any
 
 import pdfplumber
+import config
 
 _MONTHS = {
     "jan": 1,
@@ -69,6 +73,40 @@ def _clean_money(val: str | None) -> float | None:
         return None
 
 
+def _is_valid_load_id(token: str | None) -> bool:
+    """
+    Load ID uchun qattiq filtr:
+    - M-prefiksli: M12345...
+    - Yoki kamida 6 xonali raqam (5 xonali trip no emas)
+    """
+    if not token:
+        return False
+    s = str(token).strip().upper()
+    if not s:
+        return False
+    if re.fullmatch(r"M\d{5,}", s):
+        return True
+    # Raqamli dashed ID (masalan 31448-34015)
+    if re.fullmatch(r"\d{4,10}(?:-\d{3,10}){1,2}", s):
+        return True
+    # Ba'zi boardlarda load id 5 xonali yoki #008624 ko'rinishida bo'lishi mumkin
+    if re.fullmatch(r"#?\d{5,10}", s):
+        return True
+    # Alfanumerik prefiksli IDlar (masalan A123456)
+    if re.fullmatch(r"[A-Z]\d{5,10}", s):
+        return True
+    # Aralash harf/raqam ID (masalan 1LLEOEW2540, AB12CD3456)
+    compact = re.sub(r"[^A-Z0-9]", "", s)
+    if (
+        len(compact) >= 7
+        and re.search(r"[A-Z]", compact)
+        and re.search(r"\d", compact)
+        and re.fullmatch(r"[A-Z0-9]+", compact)
+    ):
+        return True
+    return False
+
+
 def _extract_gross_rate_from_cell(cell: Any) -> float | None:
     """
     Rate (Gross) katagidan aynan gross summani oladi:
@@ -113,25 +151,39 @@ def _trip_id_from_cell(cell: Any) -> str | None:
     # - Katakning pastroqda turgan qiymati (odatda yashil) afzal
     candidates: list[tuple[int, str]] = []
     for li, line in enumerate(lines):
+        # Dashed numeric load id (masalan 31448-34015)
+        for m in re.finditer(r"\b(\d{4,10}(?:-\d{3,10}){1,2})\b", line):
+            tok = m.group(1).upper()
+            score = 140 + li * 3
+            candidates.append((score, tok))
+        # Aralash alfanumerik ID (ko'pincha yashil LOAD ID shu formatda keladi)
+        for m in re.finditer(r"\b([A-Z0-9]{7,16})\b", line.upper()):
+            tok = m.group(1).upper()
+            if not (re.search(r"[A-Z]", tok) and re.search(r"\d", tok)):
+                continue
+            score = 130 + li * 3
+            candidates.append((score, tok))
         # M-prefiksli ID
         for m in re.finditer(r"\b(M\d{5,})\b", line, re.I):
             tok = m.group(1).upper()
             score = 100 + li * 3
             candidates.append((score, tok))
         # Raqamli ID
-        for m in re.finditer(r"\b(\d{5,8})\b", line):
+        for m in re.finditer(r"(#?\d{5,10})", line):
             tok = m.group(1)
             score = 40 + li * 3
             if len(tok) >= 6:
                 score += 20
             # Ko'p PDFlarda qizil trip no 70xxx bo'ladi
-            if len(tok) == 5 and tok.startswith("70"):
+            if len(tok.lstrip("#")) == 5 and tok.lstrip("#").startswith("70"):
                 score -= 35
             candidates.append((score, tok))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        for _, tok in candidates:
+            if _is_valid_load_id(tok):
+                return tok
     return None
 
 
@@ -353,15 +405,16 @@ def _parse_trips_from_free_text(text: str) -> list[dict[str, Any]]:
         for m in re.finditer(r"\b(M\d{5,})\b", line, re.I):
             tid = m.group(1).upper()
         if not tid:
-            for m in re.finditer(r"\b(\d{6,8})\b", line):
+            for m in re.finditer(r"(\d{4,10}(?:-\d{3,10}){1,2}|#?\d{5,10})", line):
                 cand = m.group(1)
-                if cand not in ("202020", "202120", "202220", "202320", "202420", "202520", "202620"):
+                clean_cand = cand.lstrip("#")
+                if clean_cand not in ("202020", "202120", "202220", "202320", "202420", "202520", "202620"):
                     tid = cand
 
         # Faqat gross summa: /mi bo'lgan unit-rate qiymatni olmaymiz
         rate = _extract_gross_rate_from_cell(line)
 
-        if tid and rate is not None and rate >= 50:
+        if tid and rate is not None and rate >= 50 and _is_valid_load_id(tid):
             out.append({"trip_id": tid, "rate_gross": rate})
 
     return out
@@ -377,7 +430,7 @@ def _parse_trips_whole_text_brute(text: str) -> list[dict[str, Any]]:
         tid = m.group(1).upper()
         tail = text[m.end() : m.end() + 500]
         rate = _extract_gross_rate_from_cell(tail)
-        if rate is not None and rate >= 100:
+        if rate is not None and rate >= 100 and _is_valid_load_id(tid):
             out.append({"trip_id": tid, "rate_gross": rate})
     return out
 
@@ -387,11 +440,117 @@ def _dedupe_trips(trips: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for t in trips:
         tid = t.get("trip_id")
-        if not tid or tid in seen:
+        if not tid or tid in seen or not _is_valid_load_id(tid):
             continue
         seen.add(tid)
         out.append(t)
     return out
+
+
+def _to_iso(d: date | None) -> str | None:
+    return d.isoformat() if isinstance(d, date) else None
+
+
+def _date_from_iso(s: str | None) -> date | None:
+    if not s:
+        return None
+    try:
+        y, m, d = [int(x) for x in str(s).split("-")]
+        return date(y, m, d)
+    except Exception:
+        return None
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    raw = text[start : end + 1]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _call_openai_settlement_parser(text: str) -> dict[str, Any] | None:
+    api_key = (config.OPENAI_API_KEY or "").strip()
+    model = (config.OPENAI_MODEL or "").strip() or "gpt-4.1-mini"
+    if not api_key or not text.strip():
+        return None
+
+    schema_hint = {
+        "driver_name": "string",
+        "percent": "number|null",
+        "work_period_raw": "string|null",
+        "work_period_start": "YYYY-MM-DD|null",
+        "work_period_end": "YYYY-MM-DD|null",
+        "trips": [{"trip_id": "string", "rate_gross": "number"}],
+    }
+    prompt = (
+        "Extract Company Driver settlement data from the text.\n"
+        "Return only one JSON object, no markdown.\n"
+        "Rules:\n"
+        "- Read only explicit values from text.\n"
+        "- trip_id must be each real LOAD id from the Trips row (if two loads, two trips entries).\n"
+        "- Ignore internal trip numbers if a separate load id exists on the same row.\n"
+        "- rate_gross must be gross amount for that same row; ignore per-mile values (/mi).\n"
+        "- Keep trips unique by trip_id.\n"
+        "- Use null when unknown.\n"
+        f"JSON shape: {json.dumps(schema_hint)}\n\n"
+        "Document text:\n"
+        f"{text[:140000]}"
+    )
+    body = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "You are a strict information extraction engine for payroll PDFs.",
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        ],
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=70) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return None
+
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return _extract_json_object(output_text)
+
+    chunks = payload.get("output") or []
+    for item in chunks:
+        content = item.get("content") or []
+        for c in content:
+            txt = c.get("text")
+            if isinstance(txt, str):
+                parsed = _extract_json_object(txt)
+                if parsed:
+                    return parsed
+    return None
 
 
 def _extract_all_tables(pdf: Any) -> list[list[list[Any]]]:
@@ -485,4 +644,66 @@ def parse_company_driver_settlement_pdf(file_content: bytes) -> dict[str, Any]:
         "anchor_date": anchor,
         "trips": trips,
         "parse_warnings": warnings,
+        "source": "heuristic",
     }
+
+
+def parse_company_driver_settlement_pdf_ai(file_content: bytes) -> dict[str, Any]:
+    """
+    GPT + heuristik gibrid parser:
+    - AI dan kerakli maydonlar olinadi
+    - AI da bo'sh qolgan joylar heuristik parser bilan to'ldiriladi
+    """
+    base = parse_company_driver_settlement_pdf(file_content)
+    warnings = list(base.get("parse_warnings") or [])
+
+    with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+        page_texts = [(p.extract_text() or "") for p in pdf.pages]
+    joined_text = "\n\n".join(page_texts)
+    ai = _call_openai_settlement_parser(joined_text)
+    if not ai:
+        warnings.append("AI parse ishlamadi; standart parser natijasi ishlatildi.")
+        base["parse_warnings"] = warnings
+        return base
+
+    ai_driver = str(ai.get("driver_name") or "").strip()
+    ai_percent = ai.get("percent")
+    ai_wp_raw = str(ai.get("work_period_raw") or "").strip() or None
+    ai_ws = _date_from_iso(ai.get("work_period_start"))
+    ai_we = _date_from_iso(ai.get("work_period_end"))
+    ai_trips_raw = ai.get("trips") if isinstance(ai.get("trips"), list) else []
+
+    ai_trips: list[dict[str, Any]] = []
+    for t in ai_trips_raw:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("trip_id") or "").strip()
+        rate = _clean_money(t.get("rate_gross"))
+        if tid and rate is not None:
+            ai_trips.append({"trip_id": tid, "rate_gross": rate})
+    ai_trips = _dedupe_trips(ai_trips)
+
+    merged = {
+        "driver_name": ai_driver or base.get("driver_name") or "",
+        "percent": int(ai_percent) if isinstance(ai_percent, (int, float)) else base.get("percent"),
+        "work_period_start": ai_ws or base.get("work_period_start"),
+        "work_period_end": ai_we or base.get("work_period_end"),
+        "work_period_raw": ai_wp_raw or base.get("work_period_raw"),
+        "anchor_date": _pick_sheet_anchor_date(
+            ai_ws or base.get("work_period_start"),
+            ai_we or base.get("work_period_end"),
+        ),
+        "trips": ai_trips or base.get("trips") or [],
+        "parse_warnings": warnings,
+        "source": "ai+heuristic",
+        "ai_debug": {
+            "trip_count_ai": len(ai_trips),
+            "trip_count_final": len(ai_trips or base.get("trips") or []),
+            "work_period_start_ai": _to_iso(ai_ws),
+            "work_period_end_ai": _to_iso(ai_we),
+        },
+    }
+    if not ai_trips:
+        warnings.append("AI trips ajratmadi; trips uchun standart parser ishlatildi.")
+    merged["parse_warnings"] = warnings
+    return merged

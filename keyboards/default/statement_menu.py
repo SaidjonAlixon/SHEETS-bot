@@ -10,10 +10,6 @@ statement_menu = ReplyKeyboardMarkup(
             KeyboardButton(text="🏢 Company Driver"),
         ],
         [
-            KeyboardButton(text="📤 Fayl yuklash"),
-            KeyboardButton(text="📈 Solishtirish natijalari"),
-        ],
-        [
             KeyboardButton(text="⬅️ Back (Main Menu)"),
             KeyboardButton(text="❌ Bekor qilish"),
         ],
