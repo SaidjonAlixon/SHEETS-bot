@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from openpyxl.styles import PatternFill
 
 import config
+from handlers.users.expenses import expense_item_date_in_segment, parse_toll_posting_date
 from keyboards.default.main_menu import get_load_select_menu, get_main_menu
 from keyboards.default.statement_menu import statement_menu
 from loader import bot, dp
@@ -68,6 +69,57 @@ def _pdf_trip_ids_match_sheet_cell(sheet_service, trip_ids: list, sheet_load_raw
     return sorted(sheet_toks) == pdf_toks
 
 
+def _find_sheet_by_alias(sheet_names: list[str], alias: str) -> str | None:
+    target = str(alias or "").strip().lower()
+    for n in sheet_names or []:
+        if str(n).strip().lower() == target:
+            return n
+    return None
+
+
+def _money_eq(a, b, eps=0.02) -> bool:
+    try:
+        return abs(float(a or 0) - float(b or 0)) <= eps
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_internal_trip_number(token: str | None) -> bool:
+    """
+    PDFdagi qizil Trips raqamlarini (masalan 71425, 71533) reportdan chiqarib tashlash.
+    """
+    if not token:
+        return False
+    s = re.sub(r"[^0-9]", "", str(token))
+    return len(s) == 5 and s.startswith("7")
+
+
+def _extract_sheet_segments(ws, year_fallback: int):
+    top_grid = ws.get("A1:Z10")
+    seg_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
+    date_matches = []
+    for r in range(min(len(top_grid), 10)):
+        row_data = top_grid[r] if r < len(top_grid) else []
+        for c in range(min(26, len(row_data))):
+            cell = row_data[c] if c < len(row_data) else None
+            if cell is None:
+                continue
+            cell_s = str(cell)
+            m = seg_re.search(cell_s)
+            if not m:
+                continue
+            year_m = re.search(r"(\d{4})", cell_s)
+            y = int(year_m.group(1)) if year_m else year_fallback
+            sm, sd = map(int, m.group(1).split("."))
+            em, ed = map(int, m.group(2).split("."))
+            start_d = pd.Timestamp(year=y, month=sm, day=sd).date()
+            end_y = y + 1 if (em, ed) < (sm, sd) else y
+            end_d = pd.Timestamp(year=end_y, month=em, day=ed).date()
+            date_matches.append((start_d, end_d, c + 1))
+    uniq = {(a, b, c): True for (a, b, c) in date_matches}
+    return sorted(list(uniq.keys()), key=lambda x: x[2])
+
+
 @dp.message(F.text == "📊 Statement Check")
 async def enter_statement(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
@@ -90,6 +142,12 @@ async def back_statement(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "⬅️ Back (Main Menu)", BotStates.StatementCompanyDriverPdf)
 async def back_company_driver_pdf(message: types.Message, state: FSMContext):
+    await state.set_state(BotStates.Statement)
+    await message.answer("Statement Check bo'limi.", reply_markup=statement_menu)
+
+
+@dp.message(F.text == "⬅️ Back (Main Menu)", BotStates.StatementOwnerOperatorPdf)
+async def back_owner_operator_pdf(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.Statement)
     await message.answer("Statement Check bo'limi.", reply_markup=statement_menu)
 
@@ -119,6 +177,30 @@ async def ask_company_driver_pdf(message: types.Message, state: FSMContext):
         "Iltimos, <b>PDF</b> faylini yuboring.\n"
         "Fayldan haydovchi ismi, foiz (Percent), ish davri va Trips jadvalidagi "
         "load/trip ID hamda Rate (Gross) o'qiladi, keyin <b>yuqoridagi kompaniya</b> Load Board bilan solishtiriladi.",
+        parse_mode="HTML",
+        reply_markup=statement_menu,
+    )
+
+
+@dp.message(F.text == "🚚 Owner Operator")
+async def ask_owner_operator_pdf(message: types.Message, state: FSMContext):
+    company = get_company(message.from_user.id)
+    if not company:
+        await message.answer(
+            "Iltimos, avval Load tanlang:",
+            reply_markup=get_load_select_menu(message.from_user.id),
+        )
+        return
+    await state.set_state(BotStates.StatementOwnerOperatorPdf)
+    await message.answer(
+        _load_board_hint(company)
+        + "🚚 <b>Owner Operator</b> settlement tekshiruvi.\n\n"
+        "Iltimos, <b>PDF</b> faylini yuboring.\n"
+        "Tekshiruvlar:\n"
+        "• Bosh qismdagi load/rate/work period → Load Board (LOAD_KEY)\n"
+        "• Fuel Transaction totals → Deduction board (EXPENSES_KEY)\n"
+        "• Toll Transaction (Device ID) → Deduction board (EXPENSES_KEY)\n\n"
+        "Natija bitta Excelda alohida listlarda yuboriladi.",
         parse_mode="HTML",
         reply_markup=statement_menu,
     )
@@ -424,10 +506,10 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
 
         for trip in parsed.get("trips") or []:
             tid = trip.get("trip_id")
-            key = sheet_service._normalize_load_num(tid) if tid else ""
-            if key and valid_load_keys and key not in valid_load_keys:
+            if _is_internal_trip_number(tid):
                 skipped_trip_like_n += 1
                 continue
+            key = sheet_service._normalize_load_num(tid) if tid else ""
 
             row_num = None
             sn = None
@@ -650,5 +732,395 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
             await message.answer(
                 "\u26a0\ufe0f Google Sheets daqiqalik limiti. 1–3 daqiqa kutib qayta yuboring."
             )
+        else:
+            await message.answer(f"Xatolik: {e}")
+
+
+@dp.message(F.document, BotStates.StatementOwnerOperatorPdf)
+async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
+    company = get_company(message.from_user.id)
+    if not company:
+        await message.answer(
+            "Iltimos, avval Load tanlang:",
+            reply_markup=get_load_select_menu(message.from_user.id),
+        )
+        return
+
+    document = message.document
+    file_name = (document.file_name or "").lower()
+    mime = (document.mime_type or "").lower()
+    if not file_name.endswith(".pdf") and mime != "application/pdf":
+        await message.answer("Iltimos, faqat <b>PDF</b> fayl yuboring.", parse_mode="HTML")
+        return
+
+    await message.answer(
+        f"PDF qabul qilindi. <b>{company}</b> bo'yicha Load/Fuel/Toll tekshiruv... ⏳",
+        parse_mode="HTML",
+    )
+    try:
+        file = await bot.get_file(document.file_id)
+        file_content = await bot.download_file(file.file_path)
+        content_bytes = file_content.read()
+        parsed = parse_company_driver_settlement_pdf_ai(content_bytes)
+        warnings = parsed.get("parse_warnings") or []
+
+        pdf_driver_name = (parsed.get("driver_name") or "").strip()
+        anchor = parsed.get("anchor_date")
+
+        sheet_service = get_sheet_service()
+        primary_sheet = sheet_service.get_sheet_by_date(anchor, company=company) if anchor else None
+        fallback_sheets = sheet_service.get_last_n_week_sheets(14, company=company)
+        sheets_to_index = list(
+            dict.fromkeys(
+                [s for s in ([primary_sheet] if primary_sheet else []) + list(fallback_sheets) if s]
+            )
+        )
+
+        load_index_cache: dict[str, dict] = {}
+        valid_load_keys: set[str] = set()
+        for sn in sheets_to_index:
+            idx = sheet_service.get_load_row_index(sn, company=company)
+            load_index_cache[sn] = idx
+            valid_load_keys.update(idx.keys())
+
+        # ---- LOAD CHECK (owner operator) ----
+        load_rows = []
+        load_ok = load_bad = load_miss = 0
+        grouped: dict[tuple[str, int], list[dict]] = defaultdict(list)
+        orphans: list[dict] = []
+        for trip in parsed.get("trips") or []:
+            tid = trip.get("trip_id")
+            if _is_internal_trip_number(tid):
+                continue
+            key = sheet_service._normalize_load_num(tid) if tid else ""
+            row_num = None
+            sn = None
+            if primary_sheet and key:
+                idx = load_index_cache.get(primary_sheet) or {}
+                if key in idx:
+                    row_num, sn = idx[key], primary_sheet
+            if not row_num and key:
+                for fb in fallback_sheets:
+                    idx = load_index_cache.get(fb) or {}
+                    if key in idx:
+                        row_num, sn = idx[key], fb
+                        break
+            if row_num and sn:
+                grouped[(sn, row_num)].append(trip)
+            else:
+                orphans.append(trip)
+
+        for (sn, row_num), trip_list in grouped.items():
+            tids = [t.get("trip_id") for t in trip_list if t.get("trip_id")]
+            sum_pdf = 0.0
+            for t in trip_list:
+                try:
+                    sum_pdf += float(t.get("rate_gross") or 0)
+                except (TypeError, ValueError):
+                    pass
+            fields = sheet_service.get_settlement_compare_fields(row_num, sn, company=company)
+            if not fields:
+                load_bad += 1
+                load_rows.append(
+                    {
+                        "Tekshiruv": "Load",
+                        "Sheet": sn,
+                        "Row": row_num,
+                        "PDF Driver": pdf_driver_name or "-",
+                        "PDF Load IDs": " + ".join(tids) if tids else "-",
+                        "PDF Rate jami": sum_pdf,
+                        "Sheet Load ID": "-",
+                        "Sheet Rate": "-",
+                        "Natija": "MOS KELMADI",
+                        "Sabab": "Sheet qatori o'qilmadi",
+                    }
+                )
+                continue
+            sheet_load = fields.get("load_number")
+            sheet_rate = fields.get("rate")
+            sheet_driver = (fields.get("driver") or "").strip()
+            id_ok = _pdf_trip_ids_match_sheet_cell(sheet_service, tids, sheet_load)
+            rate_ok = _money_eq(sum_pdf, sheet_rate)
+            drv_ok = _drivers_match(pdf_driver_name, sheet_driver) if pdf_driver_name else True
+            if id_ok and rate_ok and drv_ok:
+                load_ok += 1
+                natija = "MOS KELDI"
+                sabab = "-"
+            else:
+                load_bad += 1
+                natija = "MOS KELMADI"
+                bits = []
+                if not id_ok:
+                    bits.append("Load ID mos emas")
+                if not rate_ok:
+                    bits.append(f"Rate mos emas (PDF {sum_pdf} vs Sheet {sheet_rate})")
+                if not drv_ok:
+                    bits.append("Driver mos emas")
+                sabab = ", ".join(bits)
+            load_rows.append(
+                {
+                    "Tekshiruv": "Load",
+                    "Sheet": sn,
+                    "Row": row_num,
+                    "PDF Driver": pdf_driver_name or "-",
+                    "PDF Load IDs": " + ".join(tids) if tids else "-",
+                    "PDF Rate jami": sum_pdf,
+                    "Sheet Load ID": sheet_load,
+                    "Sheet Rate": sheet_rate,
+                    "Natija": natija,
+                    "Sabab": sabab,
+                }
+            )
+        for trip in orphans:
+            load_miss += 1
+            load_rows.append(
+                {
+                    "Tekshiruv": "Load",
+                    "Sheet": "-",
+                    "Row": "-",
+                    "PDF Driver": pdf_driver_name or "-",
+                    "PDF Load IDs": trip.get("trip_id") or "-",
+                    "PDF Rate jami": trip.get("rate_gross"),
+                    "Sheet Load ID": "-",
+                    "Sheet Rate": "-",
+                    "Natija": "MOS KELMADI",
+                    "Sabab": "Load boardda topilmadi",
+                }
+            )
+
+        # ---- EXPENSES CHECK (Fuel + Toll) ----
+        expenses_rows = []
+        exp_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
+        candidate_exp_sheets = [
+            _find_sheet_by_alias(exp_sheet_names, "Owner Operators"),
+            _find_sheet_by_alias(exp_sheet_names, "Company Drivers"),
+            _find_sheet_by_alias(exp_sheet_names, "TERMINATED"),
+        ]
+        candidate_exp_sheets = [x for x in candidate_exp_sheets if x]
+        year_now = pd.Timestamp.now().year
+
+        fuel_total_pdf = parsed.get("fuel_total_pay_amount")
+        toll_entries = parsed.get("toll_transactions") or []
+        toll_pdf_by_device: dict[str, float] = defaultdict(float)
+        for t in toll_entries:
+            did = str(t.get("device_id") or "").strip()
+            if not did:
+                continue
+            try:
+                toll_pdf_by_device[did] += float(t.get("pay_amount") or 0)
+            except (TypeError, ValueError):
+                continue
+
+        fuel_done = False
+        for sh_name in candidate_exp_sheets:
+            ws = sheet_service.get_expenses_board(sh_name, company)
+            if not ws:
+                continue
+            segments = _extract_sheet_segments(ws, year_now)
+            if not segments:
+                continue
+            top_grid = ws.get("A1:Z10")
+            card_cols, fuel_cols, trans_cols, toll_cols = [], [], [], []
+            for r in range(min(10, len(top_grid))):
+                row_data = top_grid[r] if r < len(top_grid) else []
+                for c in range(min(26, len(row_data))):
+                    txt = str(row_data[c] or "").strip().lower()
+                    if not txt:
+                        continue
+                    if ("efs" in txt and "card" in txt) or txt == "card #":
+                        card_cols.append(c + 1)
+                    if "fuel" in txt and ("exp" in txt or "after" in txt or "amount" in txt):
+                        fuel_cols.append(c + 1)
+                    if "transponder" in txt or "pptag" in txt:
+                        trans_cols.append(c + 1)
+                    if "toll" in txt and ("exp" in txt or "amount" in txt):
+                        toll_cols.append(c + 1)
+            if not fuel_cols:
+                fuel_cols = [5]
+            if not card_cols:
+                card_cols = [3, 4]
+            if not trans_cols:
+                trans_cols = [4, 3]
+            if not toll_cols:
+                toll_cols = [7]
+
+            name_vals = ws.col_values(2)
+            resolved_names = []
+            cur = ""
+            for raw in name_vals:
+                s = str(raw or "").strip()
+                if s and len(s) >= 3 and not re.match(r"^[\d\s$.,\-–—%/]+$", s):
+                    cur = s
+                resolved_names.append(cur)
+            matched_rows = []
+            if pdf_driver_name:
+                for i, drv in enumerate(resolved_names, start=1):
+                    if i < 4:
+                        continue
+                    if drv and _drivers_match(pdf_driver_name, drv):
+                        matched_rows.append(i)
+
+            seg_match = None
+            wp_start = parsed.get("work_period_start")
+            for seg in segments:
+                s_date, e_date, start_col = seg
+                if wp_start and expense_item_date_in_segment(wp_start, s_date, e_date):
+                    seg_match = seg
+                    break
+            if not seg_match:
+                seg_match = segments[0]
+            seg_idx = segments.index(seg_match)
+            seg_start_col = seg_match[2]
+            seg_end_col = segments[seg_idx + 1][2] - 1 if seg_idx + 1 < len(segments) else 26
+            fuel_col = next((fc for fc in fuel_cols if seg_start_col <= fc <= seg_end_col), fuel_cols[0])
+            trans_col = next((tc for tc in trans_cols if seg_start_col <= tc <= seg_end_col), trans_cols[0])
+            toll_col = next((tc for tc in toll_cols if seg_start_col <= tc <= seg_end_col), toll_cols[0])
+
+            # Fuel check by driver name row + week segment
+            if not fuel_done and fuel_total_pdf is not None:
+                if matched_rows:
+                    for rr in matched_rows:
+                        sheet_fuel_val = ws.cell(rr, fuel_col).value
+                        sheet_fuel_num = float(str(sheet_fuel_val or "0").replace("$", "").replace(",", "") or 0)
+                        ok = _money_eq(fuel_total_pdf, sheet_fuel_num)
+                        expenses_rows.append(
+                            {
+                                "Tekshiruv": "Fuel Total",
+                                "Sheet": sh_name,
+                                "Row": rr,
+                                "PDF Driver": pdf_driver_name or "-",
+                                "Device/Identifier": "-",
+                                "PDF Amount": fuel_total_pdf,
+                                "Sheet Amount": sheet_fuel_num,
+                                "Natija": "MOS KELDI" if ok else "MOS KELMADI",
+                                "Sabab": "-" if ok else "Fuel total mos emas",
+                            }
+                        )
+                        fuel_done = True
+                        break
+                elif pdf_driver_name:
+                    expenses_rows.append(
+                        {
+                            "Tekshiruv": "Fuel Total",
+                            "Sheet": sh_name,
+                            "Row": "-",
+                            "PDF Driver": pdf_driver_name,
+                            "Device/Identifier": "-",
+                            "PDF Amount": fuel_total_pdf,
+                            "Sheet Amount": "-",
+                            "Natija": "MOS KELMADI",
+                            "Sabab": "Driver topilmadi",
+                        }
+                    )
+                    fuel_done = True
+
+            # Toll check by device ID/transponder in each list
+            if toll_pdf_by_device:
+                trans_vals = ws.col_values(trans_col)
+                toll_vals = ws.col_values(toll_col)
+                norm_to_row = {}
+                for i, raw in enumerate(trans_vals, start=1):
+                    if i < 4:
+                        continue
+                    nv = sheet_service._normalize_load_num(raw)
+                    if nv and nv not in norm_to_row:
+                        norm_to_row[nv] = i
+                for device_id, pdf_amt in toll_pdf_by_device.items():
+                    target = sheet_service._normalize_load_num(device_id)
+                    rr = norm_to_row.get(target)
+                    if rr:
+                        raw_sheet_toll = toll_vals[rr - 1] if rr - 1 < len(toll_vals) else ""
+                        try:
+                            sheet_amt = float(str(raw_sheet_toll or "0").replace("$", "").replace(",", "") or 0)
+                        except ValueError:
+                            sheet_amt = 0.0
+                        ok = _money_eq(pdf_amt, sheet_amt)
+                        expenses_rows.append(
+                            {
+                                "Tekshiruv": "Toll Device",
+                                "Sheet": sh_name,
+                                "Row": rr,
+                                "PDF Driver": pdf_driver_name or "-",
+                                "Device/Identifier": device_id,
+                                "PDF Amount": pdf_amt,
+                                "Sheet Amount": sheet_amt,
+                                "Natija": "MOS KELDI" if ok else "MOS KELMADI",
+                                "Sabab": "-" if ok else "Toll amount mos emas",
+                            }
+                        )
+
+        if fuel_total_pdf is None:
+            expenses_rows.append(
+                {
+                    "Tekshiruv": "Fuel Total",
+                    "Sheet": "-",
+                    "Row": "-",
+                    "PDF Driver": pdf_driver_name or "-",
+                    "Device/Identifier": "-",
+                    "PDF Amount": "-",
+                    "Sheet Amount": "-",
+                    "Natija": "MOS KELMADI",
+                    "Sabab": "PDFda Fuel totals topilmadi",
+                }
+            )
+        if toll_pdf_by_device and not any(r.get("Tekshiruv") == "Toll Device" for r in expenses_rows):
+            for did, amt in toll_pdf_by_device.items():
+                expenses_rows.append(
+                    {
+                        "Tekshiruv": "Toll Device",
+                        "Sheet": "-",
+                        "Row": "-",
+                        "PDF Driver": pdf_driver_name or "-",
+                        "Device/Identifier": did,
+                        "PDF Amount": amt,
+                        "Sheet Amount": "-",
+                        "Natija": "MOS KELMADI",
+                        "Sabab": "Device ID topilmadi",
+                    }
+                )
+
+        # ---- EXPORT ----
+        load_df = pd.DataFrame(load_rows or [])
+        exp_df = pd.DataFrame(expenses_rows or [])
+        base = re.sub(r'[<>:"/\\|?*]', "_", document.file_name or "report").strip() or "report"
+        report_name = f"OwnerOperator_check_{base}.xlsx"
+        if not report_name.lower().endswith(".xlsx"):
+            report_name += ".xlsx"
+        with pd.ExcelWriter(report_name, engine="openpyxl") as writer:
+            load_df.to_excel(writer, sheet_name="Load check", index=False)
+            exp_df.to_excel(writer, sheet_name="Fuel Toll check", index=False)
+            for ws_name in ("Load check", "Fuel Toll check"):
+                ws = writer.book[ws_name]
+                green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                natija_col = None
+                for c in range(1, ws.max_column + 1):
+                    if str(ws.cell(row=1, column=c).value or "").strip() == "Natija":
+                        natija_col = c
+                        break
+                if natija_col:
+                    for r in range(2, ws.max_row + 1):
+                        natija_val = str(ws.cell(row=r, column=natija_col).value or "").strip().upper()
+                        if natija_val == "MOS KELDI":
+                            for c in range(1, ws.max_column + 1):
+                                ws.cell(row=r, column=c).fill = green_fill
+
+        warn_text = "\n".join(f"⚠️ {w}" for w in warnings) if warnings else ""
+        if warn_text:
+            await message.answer(warn_text)
+        exp_ok = sum(1 for r in expenses_rows if r.get("Natija") == "MOS KELDI")
+        exp_bad = sum(1 for r in expenses_rows if r.get("Natija") != "MOS KELDI")
+        await message.answer(
+            f"🏁 Owner Operator tekshiruv tugadi — <b>{company}</b>.\n"
+            f"📦 Load: ✅ {load_ok} | ❌ {load_bad} | ❓ {load_miss}\n"
+            f"⛽🛣️ Fuel/Toll: ✅ {exp_ok} | ❌ {exp_bad}",
+            parse_mode="HTML",
+        )
+        await message.answer_document(types.FSInputFile(report_name))
+        os.remove(report_name)
+        await state.set_state(BotStates.Statement)
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "Quota" in err or "quota" in err:
+            await message.answer("⚠️ Google Sheets daqiqalik limiti. 1–3 daqiqa kutib qayta yuboring.")
         else:
             await message.answer(f"Xatolik: {e}")

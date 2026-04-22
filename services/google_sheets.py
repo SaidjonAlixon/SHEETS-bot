@@ -236,8 +236,9 @@ class GoogleSheetService:
         s = str(val).strip()
         if not s or s.lower() in ("load #", "load", "-", "—"):
             return []
-        # // yoki || yoki bir qatorli | (masalan M1 // M2)
-        parts = re.split(r"\s*(?://|\|\|)\s*|\s*\|\s*", s)
+        # Ajratkichlar:
+        # //, ||, |, &, " and " (masalan: "4223989 & 4223990")
+        parts = re.split(r"\s*(?://|\|\|)\s*|\s*\|\s*|\s*&\s*|\s+AND\s+", s, flags=re.I)
         parts = [p.strip() for p in parts if p.strip()]
         if len(parts) <= 1 and "," in s:
             low = s.lower()

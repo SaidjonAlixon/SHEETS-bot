@@ -9,7 +9,7 @@ import json
 import re
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pdfplumber
@@ -86,6 +86,9 @@ def _is_valid_load_id(token: str | None) -> bool:
         return False
     if re.fullmatch(r"M\d{5,}", s):
         return True
+    # Harf-dash-raqam (masalan L-17906)
+    if re.fullmatch(r"[A-Z]-\d{4,10}", s):
+        return True
     # Raqamli dashed ID (masalan 31448-34015)
     if re.fullmatch(r"\d{4,10}(?:-\d{3,10}){1,2}", s):
         return True
@@ -98,7 +101,7 @@ def _is_valid_load_id(token: str | None) -> bool:
     # Aralash harf/raqam ID (masalan 1LLEOEW2540, AB12CD3456)
     compact = re.sub(r"[^A-Z0-9]", "", s)
     if (
-        len(compact) >= 7
+        len(compact) >= 6
         and re.search(r"[A-Z]", compact)
         and re.search(r"\d", compact)
         and re.fullmatch(r"[A-Z0-9]+", compact)
@@ -143,40 +146,129 @@ def _trip_id_from_cell(cell: Any) -> str | None:
     if not lines:
         parts = re.split(r"\s+", raw.strip())
         lines = [p for p in parts if p]
+    if not lines:
+        return None
+
+    def _repair_split_numeric_tokens(line: str) -> list[str]:
+        """
+        Ba'zi PDFlarda uzun load id 2 ta raqam bo'lib chiqadi (masalan: '5000' va '112074').
+        Shunday bo'lsa, ularni birlashtirib bitta token qilib qaytaramiz.
+        """
+        s = str(line or "")
+        if not s:
+            return []
+        # faqat raqam + bo'sh joy/punktuatsiya bo'lgan segmentlarni qidiramiz
+        parts = re.findall(r"\d{3,6}", s)
+        if len(parts) < 2:
+            return []
+        out: list[str] = []
+        i = 0
+        while i < len(parts):
+            a = parts[i]
+            # Agarda keyingi qism bilan birlashtirganda load id bo'lsa
+            if i + 1 < len(parts):
+                b = parts[i + 1]
+                merged = f"{a}{b}"
+                if _is_valid_load_id(merged):
+                    out.append(merged)
+                    i += 2
+                    continue
+            # yoki 3 ta bo'linma (kamdan-kam)
+            if i + 2 < len(parts):
+                c = parts[i + 2]
+                merged3 = f"{a}{b}{c}"
+                if _is_valid_load_id(merged3):
+                    out.append(merged3)
+                    i += 3
+                    continue
+            i += 1
+        return out
+
+    def _line_tokens_for_load(line: str) -> list[str]:
+        toks: list[str] = []
+        toks.extend(_repair_split_numeric_tokens(line))
+        for m in re.finditer(r"\b([A-Z]-\d{4,10})\b", line.upper()):
+            toks.append(m.group(1).upper())
+        for m in re.finditer(r"\b(\d{4,10}(?:-\d{3,10}){1,2})\b", line):
+            toks.append(m.group(1).upper())
+        for m in re.finditer(r"\b(M\d{5,})\b", line, re.I):
+            toks.append(m.group(1).upper())
+        for m in re.finditer(r"(#?\d{5,10})", line):
+            toks.append(m.group(1))
+        for m in re.finditer(r"\b([A-Z0-9]{6,16})\b", line.upper()):
+            tok = m.group(1).upper()
+            if re.search(r"[A-Z]", tok) and re.search(r"\d", tok):
+                toks.append(tok)
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in toks:
+            if t not in seen and _is_valid_load_id(t):
+                seen.add(t)
+                out.append(t)
+        return out
+
+    # Qat'iy qoida: ikki qatorli katakda 1-qator qizil trip no bo'lsa,
+    # 2-qator (pastdagi yashil) load id olinadi.
+    if len(lines) >= 2:
+        first = lines[0].strip()
+        second = lines[1].strip()
+        first_is_trip = bool(re.fullmatch(r"#?\d{5}", first)) or _looks_internal_trip_number(first)
+        second_tokens = _line_tokens_for_load(second)
+        if first_is_trip and second_tokens:
+            return second_tokens[0]
 
     # Rangni bevosita o'qib bo'lmagani uchun heuristika:
-    # - M-prefiksli ID eng ustun
-    # - 6+ xonali raqam (load id) 5 xonali trip raqamidan ustun
-    # - 70xxx ko'rinishidagi 5 xonali trip raqamga penalti
-    # - Katakning pastroqda turgan qiymati (odatda yashil) afzal
+    # - 1-qatordagi trip no (qizil, ko'pincha 5 xonali) ni e'tiborsiz qoldirish
+    # - pastki qatordagi LOAD ID (yashil) ni ustun qo'yish
+    # - 6+ xonali yoki harf+raqam ID 5 xonali trip no'dan ustun
     candidates: list[tuple[int, str]] = []
-    for li, line in enumerate(lines):
+    has_multiple_lines = len(lines) > 1
+    # Multi-line katakda pastki qatorlarni oldin tekshiramiz (yashil load id).
+    ordered_lines: list[tuple[int, str]] = []
+    if has_multiple_lines:
+        for li in range(1, len(lines)):
+            ordered_lines.append((li, lines[li]))
+        ordered_lines.append((0, lines[0]))
+    else:
+        ordered_lines.append((0, lines[0]))
+    for li, line in ordered_lines:
         # Dashed numeric load id (masalan 31448-34015)
         for m in re.finditer(r"\b(\d{4,10}(?:-\d{3,10}){1,2})\b", line):
             tok = m.group(1).upper()
-            score = 140 + li * 3
+            score = 140 + li * 20
+            candidates.append((score, tok))
+        # Harf-dash-raqam ID (masalan L-17906)
+        for m in re.finditer(r"\b([A-Z]-\d{4,10})\b", line.upper()):
+            tok = m.group(1).upper()
+            score = 145 + li * 20
             candidates.append((score, tok))
         # Aralash alfanumerik ID (ko'pincha yashil LOAD ID shu formatda keladi)
-        for m in re.finditer(r"\b([A-Z0-9]{7,16})\b", line.upper()):
+        for m in re.finditer(r"\b([A-Z0-9]{6,16})\b", line.upper()):
             tok = m.group(1).upper()
             if not (re.search(r"[A-Z]", tok) and re.search(r"\d", tok)):
                 continue
-            score = 130 + li * 3
+            score = 130 + li * 20
             candidates.append((score, tok))
         # M-prefiksli ID
         for m in re.finditer(r"\b(M\d{5,})\b", line, re.I):
             tok = m.group(1).upper()
-            score = 100 + li * 3
+            score = 100 + li * 20
             candidates.append((score, tok))
         # Raqamli ID
         for m in re.finditer(r"(#?\d{5,10})", line):
             tok = m.group(1)
-            score = 40 + li * 3
+            score = 40 + li * 20
             if len(tok) >= 6:
                 score += 20
             # Ko'p PDFlarda qizil trip no 70xxx bo'ladi
             if len(tok.lstrip("#")) == 5 and tok.lstrip("#").startswith("70"):
                 score -= 35
+            # Multi-line katakda 1-qator 5 xonali bo'lsa, bu odatda trip no.
+            if has_multiple_lines and li == 0 and len(tok.lstrip("#")) == 5:
+                score -= 80
+            # Pastki qatordagi 6+ xonali IDlar (masalan 2847062) ustun bo'lsin.
+            if has_multiple_lines and li > 0 and len(tok.lstrip("#")) >= 6:
+                score += 45
             candidates.append((score, tok))
 
     if candidates:
@@ -447,6 +539,259 @@ def _dedupe_trips(trips: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _looks_internal_trip_number(token: str | None) -> bool:
+    """
+    Qizil Trips raqamini filtrlash:
+    - odatda 5 xonali va ko'pincha 7 bilan boshlanadi (71425, 71533, ...)
+    """
+    if not token:
+        return False
+    s = str(token).strip().upper()
+    s = re.sub(r"[^A-Z0-9-]", "", s)
+    return bool(re.fullmatch(r"\d{5}", s) and s.startswith("7"))
+
+
+def _merge_trip_lists(
+    ai_trips: list[dict[str, Any]], base_trips: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """
+    AI ba'zan hamma tripni bermasligi yoki qizil trip no berishi mumkin.
+    Shuning uchun heuristicni ustun qo'yib, keyin AI qo'shimchalarini qo'shamiz.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source_idx, source in enumerate((base_trips or [], ai_trips or [])):
+        for t in source:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("trip_id") or "").strip()
+            rate = _clean_money(t.get("rate_gross"))
+            if not tid or rate is None:
+                continue
+            # AI source dan kelgan qizil 5 xonali trip numberlarni tashlab yuboramiz.
+            if source_idx == 1 and _looks_internal_trip_number(tid):
+                continue
+            key = re.sub(r"\s+", "", tid).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"trip_id": tid, "rate_gross": rate})
+    return _dedupe_trips(out)
+
+
+def _extract_section(text: str, start_label: str, end_labels: list[str]) -> str:
+    if not text:
+        return ""
+    lines = [ln.rstrip() for ln in text.replace("\r", "\n").split("\n")]
+    start_idx = -1
+    for i, line in enumerate(lines):
+        if start_label.lower() in line.lower():
+            start_idx = i
+            break
+    if start_idx < 0:
+        return ""
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        low = lines[i].lower().strip()
+        if any(lbl.lower() in low for lbl in end_labels):
+            end_idx = i
+            break
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
+def _extract_money_from_line(line: str) -> float | None:
+    vals = re.findall(r"(?:\$\s*)?[\d,]+\.\d{2}", line or "")
+    if not vals:
+        return None
+    return _clean_money(vals[-1])
+
+
+def _extract_money_next_token(line: str, token: str) -> float | None:
+    if not line:
+        return None
+    m = re.search(rf"{re.escape(token)}\s+\$?\s*([\d,]+\.\d{{2}})", line, re.I)
+    if not m:
+        return None
+    return _clean_money(m.group(1))
+
+
+def _extract_fuel_transactions(text: str) -> tuple[list[dict[str, Any]], float | None]:
+    section = _extract_section(
+        text,
+        "Fuel Transaction",
+        ["Toll Transaction", "Payout", "Deductions"],
+    )
+    if not section:
+        return [], None
+    entries: list[dict[str, Any]] = []
+    total_amount = None
+    sec = section.replace("\r", "\n")
+
+    # 1) Totals blokidan pay amountni olish (ustuvor)
+    totals_match = re.search(r"(?is)\btotals\s*:\s*(.{0,260})", sec)
+    if totals_match:
+        totals_block = totals_match.group(0)
+        total_amount = _extract_money_next_token(totals_block, "pay amount")
+        if total_amount is None:
+            vals = re.findall(r"(?:\$\s*)?[\d,]+\.\d{2}", totals_block)
+            if vals:
+                total_amount = _clean_money(vals[-1])
+
+    # 2) Tranzaksiya qatorlarini blok bo'yicha ajratish (date/time bo'yicha)
+    # Sana va vaqt bir satrda bo'lmasligi mumkin, shuning uchun whitespace/newline tolerant.
+    row_re = re.compile(
+        r"(\d{1,2}/\d{1,2}/\d{4})\s*(?:\n|\s)+(\d{1,2}:\d{2}\s*(?:AM|PM))",
+        re.I,
+    )
+    row_matches = list(row_re.finditer(sec))
+    pay_amount_rows: list[float] = []
+    cut_at = len(sec)
+    totals_pos = re.search(r"(?i)\btotals\s*:", sec)
+    if totals_pos:
+        cut_at = totals_pos.start()
+
+    for i, m in enumerate(row_matches):
+        start = m.start()
+        if start >= cut_at:
+            continue
+        end = row_matches[i + 1].start() if i + 1 < len(row_matches) else cut_at
+        end = min(end, cut_at)
+        chunk = sec[start:end]
+        vals = re.findall(r"(?:\$\s*)?[\d,]+\.\d{2}", chunk)
+        if not vals:
+            continue
+        pay = _clean_money(vals[-1])
+        if pay is None:
+            continue
+        pay_amount_rows.append(float(pay))
+        entries.append(
+            {
+                "type": "Diesel",
+                "date_time": f"{m.group(1)} {m.group(2).upper()}",
+                "pay_amount": pay,
+                "raw": chunk.strip(),
+            }
+        )
+
+    # 3) Agar totals topilmasa, Pay Amount ustunidagi jami bilan to'ldiramiz
+    if total_amount is None and pay_amount_rows:
+        total_amount = round(sum(pay_amount_rows), 2)
+    if total_amount is None and entries:
+        total_amount = round(sum(float(x.get("pay_amount") or 0) for x in entries), 2)
+    return entries, total_amount
+
+
+def _extract_toll_transactions(text: str) -> tuple[list[dict[str, Any]], float | None]:
+    matches = re.finditer(r"(?im)^.*toll transaction.*$", text or "")
+    starts = [m.start() for m in matches]
+    if not starts:
+        return [], None
+    toll_blocks: list[str] = []
+    for i, st in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        toll_blocks.append((text or "")[st:end])
+    entries: list[dict[str, Any]] = []
+    total_amount = None
+    for block in toll_blocks:
+        lines = block.replace("\r", "\n").split("\n")
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if "totals:" in low:
+                lookahead = " ".join(
+                    x.strip() for x in lines[i : min(i + 4, len(lines))] if str(x).strip()
+                )
+                line_total = _extract_money_from_line(lookahead)
+                if line_total is not None:
+                    total_amount = (total_amount or 0.0) + float(line_total)
+                continue
+            if "provider" in low and "device" in low and "pay amount" in low:
+                continue
+            # Provider nomi satr boshida bo'ladi: EZPass, ELITE va h.k.
+            provider_match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]{1,20})\b", s)
+            if not provider_match:
+                continue
+            provider = provider_match.group(1)
+            dev_match = re.search(r"\b(\d{6,})\b", s)
+            dt_match = re.search(
+                r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))", s, re.I
+            )
+            amount = _extract_money_from_line(s)
+            if dev_match and dt_match and amount is not None:
+                entries.append(
+                    {
+                        "provider": provider,
+                        "device_id": dev_match.group(1),
+                        "exit_date_time": f"{dt_match.group(1)} {dt_match.group(2).upper()}",
+                        "pay_amount": amount,
+                        "raw": s,
+                    }
+                )
+    if total_amount is None and entries:
+        total_amount = round(sum(float(x.get("pay_amount") or 0) for x in entries), 2)
+    return entries, total_amount
+
+
+def _extract_rate_near_trip_id(text: str, trip_id: str) -> float | None:
+    """
+    PDF matnda trip/load ID atrofidan Rate (Gross) ni topishga urinadi.
+    Asosiy qoida: ID dan keyin kelgan birinchi valyuta qiymati ($...) gross bo'lishi ehtimoli yuqori.
+    Muhim: mileage kabi oddiy sonlarni (masalan 660.00) rate deb olmaymiz.
+    """
+    if not text or not trip_id:
+        return None
+    raw_tid = str(trip_id).strip()
+    if not raw_tid:
+        return None
+    # MUHIM: substring qidiruv 5000112074 ichida 500011207 kabi qisqa bo'linmani ham ushlaydi
+    # va keyingi $ summani noto'g'ri qator bilan bog'laydi. Shuning uchun to'liq token qidiramiz.
+    tid_esc = re.escape(raw_tid)
+    boundary = r"(?<![A-Z0-9#-])" + tid_esc + r"(?![A-Z0-9#-])"
+    hits = list(re.finditer(boundary, text, re.I))
+    if not hits:
+        return None
+    for m in hits:
+        tail = text[m.end() : m.end() + 320]
+        # Faqat $ bilan boshlangan qiymatlar — mileage bilan chalkashmasin
+        vals = re.findall(r"\$\s*[\d,]+\.\d{2}", tail)
+        nums: list[float] = []
+        for v in vals:
+            n = _clean_money(v)
+            if n is None:
+                continue
+            # /mi unit-rate odatda kichik bo'ladi, gross esa kattaroq.
+            if n >= 100:
+                nums.append(float(n))
+        if nums:
+            return nums[0]
+    return None
+
+
+def _normalize_trip_rates_by_text(trips: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """
+    Jadvaldan noto'g'ri tushgan rate larni to'g'rilash:
+    har trip uchun PDF matndan ID yonidagi gross summani topib override qiladi.
+    """
+    out: list[dict[str, Any]] = []
+    for t in trips or []:
+        tid = str(t.get("trip_id") or "").strip()
+        rate = _clean_money(t.get("rate_gross"))
+        if not tid:
+            continue
+        near = _extract_rate_near_trip_id(text, tid)
+        # Faqat aniqroq bo'lganda override qilamiz:
+        # - current rate bo'sh bo'lsa yoki
+        # - near qiymat valyuta asosida topilgan bo'lib currentdan sezilarli farq qilsa
+        if near is not None and (rate is None or abs(float(rate) - float(near)) > 0.01):
+            rate = near
+        if rate is None:
+            continue
+        out.append({"trip_id": tid, "rate_gross": rate})
+    return _dedupe_trips(out)
+
+
 def _to_iso(d: date | None) -> str | None:
     return d.isoformat() if isinstance(d, date) else None
 
@@ -491,6 +836,8 @@ def _call_openai_settlement_parser(text: str) -> dict[str, Any] | None:
         "work_period_start": "YYYY-MM-DD|null",
         "work_period_end": "YYYY-MM-DD|null",
         "trips": [{"trip_id": "string", "rate_gross": "number"}],
+        "fuel_total_pay_amount": "number|null",
+        "toll_total_pay_amount": "number|null",
     }
     prompt = (
         "Extract Company Driver settlement data from the text.\n"
@@ -498,8 +845,18 @@ def _call_openai_settlement_parser(text: str) -> dict[str, Any] | None:
         "Rules:\n"
         "- Read only explicit values from text.\n"
         "- trip_id must be each real LOAD id from the Trips row (if two loads, two trips entries).\n"
+        "- In Trips cell, ignore top red trip number; pick the lower/second-line LOAD ID.\n"
+        "- Load ID may be numeric, alphanumeric, or letter-dash-number (e.g. L-17906).\n"
+        "- Never truncate long numeric load ids (e.g. 5000112074 must stay full length).\n"
+        "- If a load id appears split across spaces/newlines, reconstruct it as one trip_id.\n"
+        "- If first line is 5-digit trip number and second line is another id, always take second line as trip_id.\n"
         "- Ignore internal trip numbers if a separate load id exists on the same row.\n"
         "- rate_gross must be gross amount for that same row; ignore per-mile values (/mi).\n"
+        "- Read rate_gross strictly from the 'Rate (Gross)' column, not from Net Amount.\n"
+        "- Never use mileage values (e.g., 660.00, 1172.00) as rate_gross.\n"
+        "- Prefer currency-formatted gross values ($...) for rate_gross.\n"
+        "- fuel_total_pay_amount must be Fuel Transaction section TOTAL Pay Amount.\n"
+        "- toll_total_pay_amount must be Toll Transaction section TOTAL Pay Amount.\n"
         "- Keep trips unique by trip_id.\n"
         "- Use null when unknown.\n"
         f"JSON shape: {json.dumps(schema_hint)}\n\n"
@@ -613,17 +970,26 @@ def parse_company_driver_settlement_pdf(file_content: bytes) -> dict[str, Any]:
         )
 
     trips: list[dict[str, Any]] = []
+    trips_from_table = False
     for tb in all_tables:
         trips.extend(_parse_trips_from_table_strict(tb))
     if not trips:
         for tb in all_tables:
             trips.extend(_parse_trips_from_table_loose(tb))
+    if trips:
+        trips_from_table = True
     if not trips:
         trips = _parse_trips_from_free_text(text)
     if not trips:
         trips = _parse_trips_whole_text_brute(text)
 
     trips = _dedupe_trips(trips)
+    # Jadvaldan olingan triplar uchun matn bo'yicha "nearby $" override qatorlarni siljitishi mumkin.
+    # Override faqat jadval ajratilmagan holatda ishlatiladi.
+    if not trips_from_table:
+        trips = _normalize_trip_rates_by_text(trips, text)
+    fuel_entries, fuel_total = _extract_fuel_transactions(text)
+    toll_entries, toll_total = _extract_toll_transactions(text)
 
     if not trips:
         warnings.append(
@@ -643,6 +1009,10 @@ def parse_company_driver_settlement_pdf(file_content: bytes) -> dict[str, Any]:
         "work_period_raw": wraw,
         "anchor_date": anchor,
         "trips": trips,
+        "fuel_transactions": fuel_entries,
+        "fuel_total_pay_amount": fuel_total,
+        "toll_transactions": toll_entries,
+        "toll_total_pay_amount": toll_total,
         "parse_warnings": warnings,
         "source": "heuristic",
     }
@@ -672,6 +1042,8 @@ def parse_company_driver_settlement_pdf_ai(file_content: bytes) -> dict[str, Any
     ai_ws = _date_from_iso(ai.get("work_period_start"))
     ai_we = _date_from_iso(ai.get("work_period_end"))
     ai_trips_raw = ai.get("trips") if isinstance(ai.get("trips"), list) else []
+    ai_fuel_total = _clean_money(ai.get("fuel_total_pay_amount"))
+    ai_toll_total = _clean_money(ai.get("toll_total_pay_amount"))
 
     ai_trips: list[dict[str, Any]] = []
     for t in ai_trips_raw:
@@ -682,6 +1054,7 @@ def parse_company_driver_settlement_pdf_ai(file_content: bytes) -> dict[str, Any
         if tid and rate is not None:
             ai_trips.append({"trip_id": tid, "rate_gross": rate})
     ai_trips = _dedupe_trips(ai_trips)
+    merged_trips = _merge_trip_lists(ai_trips, base.get("trips") or [])
 
     merged = {
         "driver_name": ai_driver or base.get("driver_name") or "",
@@ -693,14 +1066,20 @@ def parse_company_driver_settlement_pdf_ai(file_content: bytes) -> dict[str, Any
             ai_ws or base.get("work_period_start"),
             ai_we or base.get("work_period_end"),
         ),
-        "trips": ai_trips or base.get("trips") or [],
+        "trips": merged_trips,
+        "fuel_transactions": base.get("fuel_transactions") or [],
+        "fuel_total_pay_amount": ai_fuel_total if ai_fuel_total is not None else base.get("fuel_total_pay_amount"),
+        "toll_transactions": base.get("toll_transactions") or [],
+        "toll_total_pay_amount": ai_toll_total if ai_toll_total is not None else base.get("toll_total_pay_amount"),
         "parse_warnings": warnings,
         "source": "ai+heuristic",
         "ai_debug": {
             "trip_count_ai": len(ai_trips),
-            "trip_count_final": len(ai_trips or base.get("trips") or []),
+            "trip_count_final": len(merged_trips),
             "work_period_start_ai": _to_iso(ai_ws),
             "work_period_end_ai": _to_iso(ai_we),
+            "fuel_total_ai": ai_fuel_total,
+            "toll_total_ai": ai_toll_total,
         },
     }
     if not ai_trips:

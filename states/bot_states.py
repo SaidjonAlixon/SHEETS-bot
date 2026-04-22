@@ -16,3 +16,4 @@ class BotStates(StatesGroup):
     TollSheetSelect = State()
     Statement = State()
     StatementCompanyDriverPdf = State()
+    StatementOwnerOperatorPdf = State()
