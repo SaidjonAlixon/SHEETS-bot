@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 from collections import defaultdict
@@ -17,6 +18,9 @@ from services.excel_parser import ExcelParser
 from services.google_sheets import get_sheet_service
 from states.bot_states import BotStates
 from utils.company_storage import get_company
+
+OWNER_OPERATOR_PROCESS_LOCK = asyncio.Lock()
+COMPANY_DRIVER_PROCESS_LOCK = asyncio.Lock()
 
 
 def _load_board_hint(company: str) -> str:
@@ -394,12 +398,15 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
         await message.answer("Iltimos, faqat <b>PDF</b> fayl yuboring.", parse_mode="HTML")
         return
 
-    await message.answer(
-        f"PDF qabul qilindi. <b>{company}</b> Load Board bo'yicha o'qish va solishtirish... ⏳",
-        parse_mode="HTML",
-    )
+    if COMPANY_DRIVER_PROCESS_LOCK.locked():
+        await message.answer("📥 PDF navbatga qo'shildi. Oldingi fayl(lar) tugagach ketma-ket tekshiriladi.")
 
+    await COMPANY_DRIVER_PROCESS_LOCK.acquire()
     try:
+        await message.answer(
+            f"PDF qabul qilindi. <b>{company}</b> Load Board bo'yicha o'qish va solishtirish... ⏳",
+            parse_mode="HTML",
+        )
         file = await bot.get_file(document.file_id)
         file_content = await bot.download_file(file.file_path)
         content_bytes = file_content.read()
@@ -734,6 +741,9 @@ async def handle_company_driver_pdf(message: types.Message, state: FSMContext):
             )
         else:
             await message.answer(f"Xatolik: {e}")
+    finally:
+        await asyncio.sleep(1.0)
+        COMPANY_DRIVER_PROCESS_LOCK.release()
 
 
 @dp.message(F.document, BotStates.StatementOwnerOperatorPdf)
@@ -753,11 +763,15 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
         await message.answer("Iltimos, faqat <b>PDF</b> fayl yuboring.", parse_mode="HTML")
         return
 
-    await message.answer(
-        f"PDF qabul qilindi. <b>{company}</b> bo'yicha Load/Fuel/Toll tekshiruv... ⏳",
-        parse_mode="HTML",
-    )
+    if OWNER_OPERATOR_PROCESS_LOCK.locked():
+        await message.answer("📥 PDF navbatga qo'shildi. Oldingi fayl(lar) tugagach ketma-ket tekshiriladi.")
+
+    await OWNER_OPERATOR_PROCESS_LOCK.acquire()
     try:
+        await message.answer(
+            f"PDF qabul qilindi. <b>{company}</b> bo'yicha Load/Fuel/Toll tekshiruv... ⏳",
+            parse_mode="HTML",
+        )
         file = await bot.get_file(document.file_id)
         file_content = await bot.download_file(file.file_path)
         content_bytes = file_content.read()
@@ -900,6 +914,7 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
         year_now = pd.Timestamp.now().year
 
         fuel_total_pdf = parsed.get("fuel_total_pay_amount")
+        toll_total_pdf = parsed.get("toll_total_pay_amount")
         toll_entries = parsed.get("toll_transactions") or []
         toll_pdf_by_device: dict[str, float] = defaultdict(float)
         for t in toll_entries:
@@ -912,6 +927,7 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
                 continue
 
         fuel_done = False
+        toll_done = False
         for sh_name in candidate_exp_sheets:
             ws = sheet_service.get_expenses_board(sh_name, company)
             if not ws:
@@ -1014,8 +1030,46 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
                     )
                     fuel_done = True
 
-            # Toll check by device ID/transponder in each list
-            if toll_pdf_by_device:
+            # Toll total check (ustuvor): PDFdagi Totals: qatoridagi Pay Amount
+            if not toll_done and toll_total_pdf is not None:
+                if matched_rows:
+                    for rr in matched_rows:
+                        sheet_toll_val = ws.cell(rr, toll_col).value
+                        sheet_toll_num = float(str(sheet_toll_val or "0").replace("$", "").replace(",", "") or 0)
+                        ok = _money_eq(toll_total_pdf, sheet_toll_num)
+                        expenses_rows.append(
+                            {
+                                "Tekshiruv": "Toll Total",
+                                "Sheet": sh_name,
+                                "Row": rr,
+                                "PDF Driver": pdf_driver_name or "-",
+                                "Device/Identifier": "-",
+                                "PDF Amount": toll_total_pdf,
+                                "Sheet Amount": sheet_toll_num,
+                                "Natija": "MOS KELDI" if ok else "MOS KELMADI",
+                                "Sabab": "-" if ok else "Toll total amount mos emas",
+                            }
+                        )
+                        toll_done = True
+                        break
+                elif pdf_driver_name:
+                    expenses_rows.append(
+                        {
+                            "Tekshiruv": "Toll Total",
+                            "Sheet": sh_name,
+                            "Row": "-",
+                            "PDF Driver": pdf_driver_name,
+                            "Device/Identifier": "-",
+                            "PDF Amount": toll_total_pdf,
+                            "Sheet Amount": "-",
+                            "Natija": "MOS KELMADI",
+                            "Sabab": "Driver topilmadi",
+                        }
+                    )
+                    toll_done = True
+
+            # Toll check by device ID/transponder in each list (fallback)
+            if not toll_done and toll_pdf_by_device:
                 trans_vals = ws.col_values(trans_col)
                 toll_vals = ws.col_values(toll_col)
                 norm_to_row = {}
@@ -1063,7 +1117,9 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
                     "Sabab": "PDFda Fuel totals topilmadi",
                 }
             )
-        if toll_pdf_by_device and not any(r.get("Tekshiruv") == "Toll Device" for r in expenses_rows):
+        if toll_total_pdf is None and toll_pdf_by_device and not any(
+            r.get("Tekshiruv") in ("Toll Device", "Toll Total") for r in expenses_rows
+        ):
             for did, amt in toll_pdf_by_device.items():
                 expenses_rows.append(
                     {
@@ -1121,6 +1177,17 @@ async def handle_owner_operator_pdf(message: types.Message, state: FSMContext):
     except Exception as e:
         err = str(e)
         if "429" in err or "Quota" in err or "quota" in err:
-            await message.answer("⚠️ Google Sheets daqiqalik limiti. 1–3 daqiqa kutib qayta yuboring.")
+            await message.answer(
+                "⚠️ Google Sheets daqiqalik limiti. Fayl navbatda qoladi, "
+                "bir necha daqiqadan keyin qayta urinib yuboring."
+            )
+        elif "timeout" in err.lower():
+            await message.answer(
+                "⚠️ Tarmoq timeout bo'ldi. Fayllar ko'p bo'lsa ketma-ket tekshirishni kuting va qayta yuboring."
+            )
         else:
             await message.answer(f"Xatolik: {e}")
+    finally:
+        # Ketma-ket yuborilgan PDFlar orasida kichik pauza quota urilish ehtimolini kamaytiradi.
+        await asyncio.sleep(1.0)
+        OWNER_OPERATOR_PROCESS_LOCK.release()

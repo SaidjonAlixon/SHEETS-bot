@@ -17,3 +17,4 @@ class BotStates(StatesGroup):
     Statement = State()
     StatementCompanyDriverPdf = State()
     StatementOwnerOperatorPdf = State()
+    StatementContractorPdf = State()

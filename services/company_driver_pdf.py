@@ -697,6 +697,7 @@ def _extract_toll_transactions(text: str) -> tuple[list[dict[str, Any]], float |
     total_amount = None
     for block in toll_blocks:
         lines = block.replace("\r", "\n").split("\n")
+        last_device_id: str | None = None
         for i, line in enumerate(lines):
             s = line.strip()
             if not s:
@@ -718,15 +719,20 @@ def _extract_toll_transactions(text: str) -> tuple[list[dict[str, Any]], float |
                 continue
             provider = provider_match.group(1)
             dev_match = re.search(r"\b(\d{6,})\b", s)
+            if dev_match:
+                last_device_id = dev_match.group(1)
             dt_match = re.search(
                 r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))", s, re.I
             )
             amount = _extract_money_from_line(s)
-            if dev_match and dt_match and amount is not None:
+            # Ba'zi PDFlarda keyingi qatorlarda device id bo'sh keladi;
+            # bunday holatda oldingi qatordagi device id ni davom ettiramiz.
+            device_id = dev_match.group(1) if dev_match else last_device_id
+            if device_id and dt_match and amount is not None:
                 entries.append(
                     {
                         "provider": provider,
-                        "device_id": dev_match.group(1),
+                        "device_id": device_id,
                         "exit_date_time": f"{dt_match.group(1)} {dt_match.group(2).upper()}",
                         "pay_amount": amount,
                         "raw": s,
