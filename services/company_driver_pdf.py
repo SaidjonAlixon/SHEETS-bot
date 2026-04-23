@@ -119,23 +119,26 @@ def _extract_gross_rate_from_cell(cell: Any) -> float | None:
     if cell is None:
         return None
     raw = str(cell).replace("\r", "\n")
-    # Avval qatorlar bo'yicha: 1-qatorda gross bo'lishi ehtimoli eng yuqori
-    for line in [x.strip() for x in raw.split("\n") if x.strip()]:
-        # /mi bo'lsa bu unit-rate; o'tkazib yuboramiz
-        if "/mi" in line.lower():
+    # Qat'iy qoida:
+    # - Rate (Gross) katagidagi birinchi (yuqoridagi) summa olinadi
+    # - /mi bo'lgan unit-rate summalar e'tiborga olinmaydi
+    lines = [x.strip() for x in raw.split("\n") if x.strip()]
+    for line in lines:
+        segment = line
+        low = line.lower()
+        if "/mi" in low:
+            # /mi dan keyingi qiymatlar unit-rate, gross emas.
+            segment = line[: low.index("/mi")]
+        # Faqat 2 xonali decimal qiymatlarni olamiz; 2.918 kabi /mi qiymat tushmasin.
+        vals = re.findall(r"(?:\$\s*)?[\d,]+\.\d{2}(?!\d)", segment)
+        if not vals:
             continue
-        vals = re.findall(r"\$\s*[\d,]+\.\d{2}", line)
-        for v in vals:
-            m = _clean_money(v)
-            if m is not None and m >= 50:
-                return m
-    # fallback: katak ichidagi barcha valyuta qiymatlaridan eng kattasi (gross odatda eng katta)
-    vals = re.findall(r"\$\s*[\d,]+\.\d{2}", raw)
-    nums = [(_clean_money(v) or 0.0) for v in vals]
-    nums = [n for n in nums if n >= 50]
-    if nums:
-        return max(nums)
-    return _clean_money(raw)
+        first_val = _clean_money(vals[0])
+        if first_val is not None and first_val >= 50:
+            return first_val
+
+    # Katakdan aniq gross topilmasa None qaytaramiz (noto'g'ri /mi olishdan ko'ra yaxshi).
+    return None
 
 
 def _trip_id_from_cell(cell: Any) -> str | None:
@@ -792,6 +795,26 @@ def _normalize_trip_rates_by_text(trips: list[dict[str, Any]], text: str) -> lis
     return _dedupe_trips(out)
 
 
+def _repair_suspicious_trip_rates(trips: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """
+    Ba'zan AI/fallback `rate_gross` ni 89, 24, 9 kabi noto'g'ri mayda qiymat qilib yuboradi.
+    Shunday hollarda load id atrofidan qayta gross ($...) topib tuzatamiz.
+    """
+    out: list[dict[str, Any]] = []
+    for t in trips or []:
+        tid = str(t.get("trip_id") or "").strip()
+        rate = _clean_money(t.get("rate_gross"))
+        if not tid or rate is None:
+            continue
+        # Real gross odatda ancha katta bo'ladi; 100 dan kichik bo'lsa shubhali deb olamiz.
+        if float(rate) < 100:
+            near = _extract_rate_near_trip_id(text, tid)
+            if near is not None and float(near) >= 100:
+                rate = near
+        out.append({"trip_id": tid, "rate_gross": rate})
+    return _dedupe_trips(out)
+
+
 def _to_iso(d: date | None) -> str | None:
     return d.isoformat() if isinstance(d, date) else None
 
@@ -853,6 +876,7 @@ def _call_openai_settlement_parser(text: str) -> dict[str, Any] | None:
         "- Ignore internal trip numbers if a separate load id exists on the same row.\n"
         "- rate_gross must be gross amount for that same row; ignore per-mile values (/mi).\n"
         "- Read rate_gross strictly from the 'Rate (Gross)' column, not from Net Amount.\n"
+        "- In each Rate (Gross) cell, take only the first/top amount (green one), never the lower '/mi' amount.\n"
         "- Never use mileage values (e.g., 660.00, 1172.00) as rate_gross.\n"
         "- Prefer currency-formatted gross values ($...) for rate_gross.\n"
         "- fuel_total_pay_amount must be Fuel Transaction section TOTAL Pay Amount.\n"
@@ -988,6 +1012,7 @@ def parse_company_driver_settlement_pdf(file_content: bytes) -> dict[str, Any]:
     # Override faqat jadval ajratilmagan holatda ishlatiladi.
     if not trips_from_table:
         trips = _normalize_trip_rates_by_text(trips, text)
+    trips = _repair_suspicious_trip_rates(trips, text)
     fuel_entries, fuel_total = _extract_fuel_transactions(text)
     toll_entries, toll_total = _extract_toll_transactions(text)
 
@@ -1051,7 +1076,7 @@ def parse_company_driver_settlement_pdf_ai(file_content: bytes) -> dict[str, Any
             continue
         tid = str(t.get("trip_id") or "").strip()
         rate = _clean_money(t.get("rate_gross"))
-        if tid and rate is not None:
+        if tid and rate is not None and float(rate) >= 100:
             ai_trips.append({"trip_id": tid, "rate_gross": rate})
     ai_trips = _dedupe_trips(ai_trips)
     merged_trips = _merge_trip_lists(ai_trips, base.get("trips") or [])
