@@ -28,6 +28,25 @@ from utils.company_storage import get_company
 CONTRACTOR_PROCESS_LOCK = asyncio.Lock()
 
 
+def _is_gs_quota_error(err: Exception) -> bool:
+    s = str(err or "")
+    low = s.lower()
+    return "429" in s or "quota" in low or "rate limit" in low or "resource_exhausted" in low
+
+
+async def _gs_retry(fn, retries: int = 4, base_delay: float = 1.2):
+    last = None
+    for i in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not _is_gs_quota_error(e) or i >= retries:
+                raise
+            await asyncio.sleep(base_delay * (2**i))
+    raise last
+
+
 @dp.message(F.text == "👷 Contractor")
 async def ask_contractor_pdf(message: types.Message, state: FSMContext):
     company = get_company(message.from_user.id)
@@ -89,15 +108,21 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
 
         sheet_service = get_sheet_service()
         anchor = parsed.get("anchor_date")
-        primary_sheet = sheet_service.get_sheet_by_date(anchor, company=company) if anchor else None
-        fallback_sheets = sheet_service.get_last_n_week_sheets(14, company=company)
+        primary_sheet = (
+            await _gs_retry(lambda: sheet_service.get_sheet_by_date(anchor, company=company))
+            if anchor
+            else None
+        )
+        fallback_sheets = await _gs_retry(lambda: sheet_service.get_last_n_week_sheets(14, company=company))
         sheets_to_index = list(
             dict.fromkeys([s for s in ([primary_sheet] if primary_sheet else []) + list(fallback_sheets) if s])
         )
 
         load_index_cache: dict[str, dict] = {}
         for sn in sheets_to_index:
-            load_index_cache[sn] = sheet_service.get_load_row_index(sn, company=company)
+            load_index_cache[sn] = await _gs_retry(
+                lambda sn=sn: sheet_service.get_load_row_index(sn, company=company)
+            )
 
         load_rows = []
         load_ok = load_bad = load_miss = 0
@@ -136,7 +161,11 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
                         pdf_rate_sum += float(t.get("rate_gross") or 0)
                     except (TypeError, ValueError):
                         pass
-                fields = sheet_service.get_settlement_compare_fields(row_num, sn, company=company)
+                fields = await _gs_retry(
+                    lambda row_num=row_num, sn=sn: sheet_service.get_settlement_compare_fields(
+                        row_num, sn, company=company
+                    )
+                )
                 if not fields:
                     load_bad += 1
                     load_rows.append(
@@ -211,7 +240,7 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
                 )
 
         expenses_rows = []
-        exp_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
+        exp_sheet_names = await _gs_retry(lambda: sheet_service.get_expenses_all_sheet_names(company))
         candidate_exp_sheets = [
             _find_sheet_by_alias(exp_sheet_names, "Owner Operators"),
             _find_sheet_by_alias(exp_sheet_names, "Company Drivers"),
@@ -237,13 +266,13 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
         # Har bir expenses sheet uchun metadata ni oldindan yig'ib qo'yamiz.
         exp_contexts = []
         for sh_name in candidate_exp_sheets:
-            ws = sheet_service.get_expenses_board(sh_name, company)
+            ws = await _gs_retry(lambda sh_name=sh_name: sheet_service.get_expenses_board(sh_name, company))
             if not ws:
                 continue
             segments = _extract_sheet_segments(ws, year_now)
             if not segments:
                 continue
-            top_grid = ws.get("A1:Z10")
+            top_grid = await _gs_retry(lambda ws=ws: ws.get("A1:Z10"))
             fuel_cols, toll_cols = [], []
             for r in range(min(10, len(top_grid))):
                 row_data = top_grid[r] if r < len(top_grid) else []
@@ -272,7 +301,9 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
             fuel_col = next((fc for fc in fuel_cols if seg_start_col <= fc <= seg_end_col), fuel_cols[0])
             toll_col = next((tc for tc in toll_cols if seg_start_col <= tc <= seg_end_col), toll_cols[0])
 
-            name_vals = ws.col_values(2)
+            name_vals = await _gs_retry(lambda ws=ws: ws.col_values(2))
+            fuel_vals = await _gs_retry(lambda ws=ws, fuel_col=fuel_col: ws.col_values(fuel_col))
+            toll_vals = await _gs_retry(lambda ws=ws, toll_col=toll_col: ws.col_values(toll_col))
             resolved_names = []
             cur = ""
             for raw in name_vals:
@@ -286,6 +317,8 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
                     "ws": ws,
                     "fuel_col": fuel_col,
                     "toll_col": toll_col,
+                    "fuel_vals": fuel_vals,
+                    "toll_vals": toll_vals,
                     "resolved_names": resolved_names,
                 }
             )
@@ -302,15 +335,16 @@ async def handle_contractor_pdf(message: types.Message, state: FSMContext):
 
             best = None
             for ctx in exp_contexts:
-                ws = ctx["ws"]
                 resolved_names = ctx["resolved_names"]
+                fuel_vals = ctx["fuel_vals"]
+                toll_vals = ctx["toll_vals"]
                 for i, drv in enumerate(resolved_names, start=1):
                     if i < 4:
                         continue
                     if not drv or not _drivers_match(driver_name, drv):
                         continue
-                    sheet_fuel = _to_amount(ws.cell(i, ctx["fuel_col"]).value)
-                    sheet_toll = _to_amount(ws.cell(i, ctx["toll_col"]).value)
+                    sheet_fuel = _to_amount(fuel_vals[i - 1]) if i - 1 < len(fuel_vals) else None
+                    sheet_toll = _to_amount(toll_vals[i - 1]) if i - 1 < len(toll_vals) else None
                     score = 0
                     if fuel_total is not None and sheet_fuel is not None and _money_eq(fuel_total, sheet_fuel):
                         score += 1
