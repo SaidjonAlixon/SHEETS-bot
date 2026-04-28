@@ -854,7 +854,7 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 def _call_openai_settlement_parser(text: str) -> dict[str, Any] | None:
     api_key = (config.OPENAI_API_KEY or "").strip()
-    model = (config.OPENAI_MODEL or "").strip() or "gpt-4.1-mini"
+    model = (config.OPENAI_MODEL or "").strip() or "gpt-4.1"
     if not api_key or not text.strip():
         return None
 

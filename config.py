@@ -15,7 +15,7 @@ GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
 GOOGLE_SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY")
 GOOGLE_EXPENSES_SHEET_KEY = os.getenv("GOOGLE_EXPENSES_SHEET_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip()
 
 # 5 kompaniya: har birida load (Factoring+Broker) va expenses (Fuel+Toll) sheetlar
 COMPANY_NAMES = ("DELO", "MNK", "BUTATA", "AKA FS", "NYBC LLC")

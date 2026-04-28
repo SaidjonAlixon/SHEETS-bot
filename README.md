@@ -16,6 +16,14 @@ Telegram bot for managing logistics load board via Google Sheets.
     ```bash
     pip install -r requirements.txt
     ```
+    Optional extras:
+    ```bash
+    # OCR/scanned PDF support
+    pip install -r requirements-ocr.txt
+
+    # Production reliability/observability helpers
+    pip install -r requirements-prod.txt
+    ```
 3.  **Environment Variables**:
     Create a `.env` file based on `.env.example`:
     -   `BOT_TOKEN`: Telegram bot token.
