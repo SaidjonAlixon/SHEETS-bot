@@ -17,7 +17,9 @@ def _db():
 
 def _cursor():
     db = _db()
-    return db.cursor if db and db.connection else None
+    if not db:
+        return None
+    return db.cursor if db.ensure_cursor() else None
 
 def get_all_admin_ids() -> list:
     """Barcha admin ID lar: .env + DB dan."""

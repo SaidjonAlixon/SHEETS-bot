@@ -1,7 +1,6 @@
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import config
-from datetime import datetime
 
 _db_instance = None
 
@@ -13,26 +12,65 @@ def get_db():
 
 class Database:
     def __init__(self):
+        self.db_url = None
+        self.connection = None
+        self.cursor = None
         if not getattr(config, "DATABASE_URL", None):
             print("Database connection failed: DATABASE_URL .env da yo'q")
-            self.connection = None
-            self.cursor = None
             return
+        self.db_url = config.DATABASE_URL
+        if self.db_url.startswith("postgres://"):
+            self.db_url = self.db_url.replace("postgres://", "postgresql://", 1)
+        self._connect()
+        self.create_tables()
+    
+    def _connect(self):
         try:
-            db_url = config.DATABASE_URL
-            if db_url.startswith("postgres://"):
-                db_url = db_url.replace("postgres://", "postgresql://", 1)
-            self.connection = psycopg2.connect(db_url)
+            self.connection = psycopg2.connect(
+                self.db_url,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            self.connection.autocommit = False
             self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-            self.create_tables()
             print("Database connected successfully.")
         except Exception as e:
             print(f"Database connection failed: {e}")
             self.connection = None
             self.cursor = None
+    
+    def ensure_connection(self):
+        try:
+            if self.connection and getattr(self.connection, "closed", 1) == 0:
+                return True
+        except Exception:
+            pass
+        self._connect()
+        return bool(self.connection and getattr(self.connection, "closed", 1) == 0)
+    
+    def ensure_cursor(self):
+        if not self.ensure_connection():
+            return False
+        try:
+            if self.cursor and getattr(self.cursor, "closed", 1) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+            return True
+        except Exception as e:
+            print(f"Cursor recreation failed: {e}")
+            self.connection = None
+            self.cursor = None
+            return False
 
     def create_tables(self):
-        if not self.connection: return
+        if not self.ensure_cursor():
+            return
         try:
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -114,10 +152,12 @@ class Database:
             self.connection.commit()
         except Exception as e:
             print(f"Error creating tables: {e}")
-            self.connection.rollback()
+            if self.connection:
+                self.connection.rollback()
 
     def add_log(self, user_id, action, details=None, result=None, username=None, full_name=None):
-        if not self.connection: return
+        if not self.ensure_cursor():
+            return
         try:
             self.cursor.execute("""
                 INSERT INTO activity_logs (user_id, username, full_name, action, details, result)
@@ -126,9 +166,12 @@ class Database:
             self.connection.commit()
         except Exception as e:
             print(f"Error adding log: {e}")
+            if self.connection:
+                self.connection.rollback()
 
     def get_recent_logs(self, limit=50):
-        if not self.connection: return []
+        if not self.ensure_cursor():
+            return []
         try:
             self.cursor.execute("""
                 SELECT id, timestamp, user_id, username, full_name, action, details, result
@@ -141,7 +184,8 @@ class Database:
 
     def get_users_with_activity(self, env_admin_ids=None):
         """Faqat hozir dostupi bor foydalanuvchilar (allowed_users, admins, .env ADMINS)."""
-        if not self.connection: return []
+        if not self.ensure_cursor():
+            return []
         try:
             env_ids = [int(x) for x in (env_admin_ids or []) if str(x).strip().isdigit()]
             if env_ids:
@@ -175,7 +219,8 @@ class Database:
 
     def get_logs_by_user(self, user_id, limit=5000):
         """Foydalanuvchi barcha aktivliklari (dostup berilgandan beri)."""
-        if not self.connection: return []
+        if not self.ensure_cursor():
+            return []
         try:
             self.cursor.execute("""
                 SELECT timestamp, action, details, result, username, full_name
@@ -189,7 +234,7 @@ class Database:
             return []
 
     def set_user_company(self, user_id: int, company: str) -> None:
-        if not self.connection:
+        if not self.ensure_cursor():
             return
         try:
             self.cursor.execute(
@@ -208,7 +253,7 @@ class Database:
             self.connection.rollback()
 
     def get_user_company(self, user_id: int):
-        if not self.connection:
+        if not self.ensure_cursor():
             return None
         try:
             self.cursor.execute(
@@ -222,6 +267,15 @@ class Database:
             return None
 
     def close(self):
+        if self.cursor:
+            try:
+                self.cursor.close()
+            except Exception:
+                pass
+            self.cursor = None
         if self.connection:
-            self.cursor.close()
-            self.connection.close()
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
