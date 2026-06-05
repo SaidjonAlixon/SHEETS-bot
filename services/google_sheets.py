@@ -103,6 +103,35 @@ class GoogleSheetService:
                     continue
                 raise
 
+    def _update_cells_resilient(self, ws, cells):
+        """
+        Avval batch yozish; protected cell bo'lsa qator bo'yicha qayta urinadi.
+        Qaytaradi: muvaffaqiyatsiz qator raqamlari (row).
+        """
+        if not cells:
+            return []
+        try:
+            self._retry_on_429(ws.update_cells, cells)
+            return []
+        except Exception as e:
+            if "protected" not in str(e).lower():
+                raise
+
+        cells_by_row = {}
+        for cell in cells:
+            cells_by_row.setdefault(cell.row, []).append(cell)
+
+        failed_rows = []
+        for row_num in sorted(cells_by_row):
+            try:
+                self._retry_on_429(ws.update_cells, cells_by_row[row_num])
+            except Exception as row_e:
+                if "protected" in str(row_e).lower():
+                    failed_rows.append(row_num)
+                else:
+                    raise
+        return failed_rows
+
     def get_load_board(self, sheet_name=None, company=None):
         spreadsheet = self._get_load_spreadsheet(company)
         if not spreadsheet:
@@ -425,6 +454,7 @@ class GoogleSheetService:
 
         results = []
         cells_by_sheet = {}
+        pending_by_sheet = {}
         updated = 0
         skipped = 0
         not_found = 0
@@ -447,18 +477,36 @@ class GoogleSheetService:
             if self._is_empty_or_zero(inv_cur):
                 if sheet_name not in cells_by_sheet:
                     cells_by_sheet[sheet_name] = []
+                if sheet_name not in pending_by_sheet:
+                    pending_by_sheet[sheet_name] = []
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=16, value=amount))
                 cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Invoiced"))
                 updated += 1
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "UPDATED"})
+                pending_by_sheet[sheet_name].append((len(results) - 1, row_num))
             else:
                 skipped += 1
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "SKIPPED"})
 
         for sn, cells in cells_by_sheet.items():
             ws = sheet_cache.get(sn) or self.get_load_board(sn, company)
-            if ws and cells:
-                self._retry_on_429(ws.update_cells, cells)
+            if not (ws and cells):
+                continue
+            try:
+                failed_rows = set(self._update_cells_resilient(ws, cells))
+            except Exception:
+                for result_idx, _ in pending_by_sheet.get(sn, []):
+                    results[result_idx]["Status"] = "ERROR"
+                cnt = len(pending_by_sheet.get(sn, []))
+                skipped += cnt
+                updated = max(0, updated - cnt)
+                continue
+            if failed_rows:
+                for result_idx, row_num in pending_by_sheet.get(sn, []):
+                    if row_num in failed_rows:
+                        results[result_idx]["Status"] = "PROTECTED CELL"
+                        skipped += 1
+                        updated = max(0, updated - 1)
 
         return (updated, skipped, not_found, results)
 
@@ -547,23 +595,23 @@ class GoogleSheetService:
 
         for sn, cells in cells_by_sheet.items():
             ws = sheet_cache.get(sn) or self.get_load_board(sn, company)
-            if ws and cells:
-                try:
-                    self._retry_on_429(ws.update_cells, cells)
-                except Exception as e:
-                    err = str(e).lower()
-                    # Protected range bo'lsa batch yiqiladi.
-                    # Tezlik uchun qatorma-qator qayta yozishga urinmaymiz, reportga belgilaymiz.
-                    if "protected" in err:
-                        for result_idx, _, _ in pending_by_sheet.get(sn, []):
-                            results[result_idx]["Status"] = "PROTECTED CELL"
-                        skipped += len(pending_by_sheet.get(sn, []))
-                        updated = max(0, updated - len(pending_by_sheet.get(sn, [])))
-                    else:
-                        for result_idx, _, _ in pending_by_sheet.get(sn, []):
-                            results[result_idx]["Status"] = "ERROR"
-                        skipped += len(pending_by_sheet.get(sn, []))
-                        updated = max(0, updated - len(pending_by_sheet.get(sn, [])))
+            if not (ws and cells):
+                continue
+            try:
+                failed_rows = set(self._update_cells_resilient(ws, cells))
+            except Exception:
+                for result_idx, _, _ in pending_by_sheet.get(sn, []):
+                    results[result_idx]["Status"] = "ERROR"
+                cnt = len(pending_by_sheet.get(sn, []))
+                skipped += cnt
+                updated = max(0, updated - cnt)
+                continue
+            if failed_rows:
+                for result_idx, row_num, _ in pending_by_sheet.get(sn, []):
+                    if row_num in failed_rows:
+                        results[result_idx]["Status"] = "PROTECTED CELL"
+                        skipped += 1
+                        updated = max(0, updated - 1)
 
         return (updated, skipped, not_found, results)
 

@@ -5,6 +5,7 @@ from loader import dp, bot
 from keyboards.default.factoring_menu import factoring_menu
 from keyboards.default.main_menu import get_main_menu, get_load_select_menu
 from services.excel_parser import ExcelParser
+from gspread.exceptions import APIError as GspreadAPIError
 from services.google_sheets import get_sheet_service
 from states.bot_states import BotStates
 from utils.company_storage import get_company
@@ -272,9 +273,19 @@ async def _process_factoring_auto(parsed_data: list, file_name: str, state: FSMC
         await bot.send_message(chat_id, "❌ Sana oralig'i bo'lgan listlar topilmadi.")
         return
 
-    updated_count, skipped_count, not_found_count, results = sheet_service.update_factoring_across_sheets(
-        sheet_names, parsed_data, company=company
-    )
+    try:
+        updated_count, skipped_count, not_found_count, results = sheet_service.update_factoring_across_sheets(
+            sheet_names, parsed_data, company=company
+        )
+    except GspreadAPIError as e:
+        if "429" in str(e):
+            await bot.send_message(chat_id, "⚠️ Google Sheets limiti tugadi. 1–2 daqiqa kutib qayta urinib ko'ring.")
+        else:
+            await bot.send_message(chat_id, f"Sheet xatolik: {e}")
+        return
+    except Exception as e:
+        await bot.send_message(chat_id, f"Xatolik: {e}")
+        return
 
     await state.set_state(BotStates.Factoring)
 
@@ -306,6 +317,8 @@ async def _process_factoring_auto(parsed_data: list, file_name: str, state: FSMC
                 if "UPDATED" in v:
                     cell.fill = green_fill
                 elif "SKIPPED" in v:
+                    cell.fill = yellow_fill
+                elif "PROTECTED" in v:
                     cell.fill = yellow_fill
                 elif "NOT FOUND" in v or "EMPTY" in v:
                     cell.fill = red_fill
