@@ -50,7 +50,7 @@ async def factoring_recent_loads(message: types.Message, state: FSMContext):
         return
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except Exception as e:
         if "429" in str(e):
             await message.answer("⚠️ Google Sheets limiti tugadi. 1–2 daqiqa kutib qayta urinib ko'ring.")
@@ -87,7 +87,7 @@ async def callback_recent_sheet(callback: types.CallbackQuery):
     await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...")
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except Exception as e:
         await callback.message.edit_text(f"Xatolik: {e}")
         return
@@ -165,7 +165,7 @@ async def factoring_report_ask(message: types.Message, state: FSMContext):
         return
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except Exception as e:
         if "429" in str(e):
             await message.answer("⚠️ Google Sheets limiti tugadi. 1–2 daqiqa kutib qayta urinib ko'ring.")
@@ -202,7 +202,7 @@ async def callback_report_sheet(callback: types.CallbackQuery):
     await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...")
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except Exception as e:
         await callback.message.edit_text(f"Xatolik: {e}")
         return

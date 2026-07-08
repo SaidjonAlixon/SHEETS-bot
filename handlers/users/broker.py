@@ -44,7 +44,7 @@ async def broker_recent_payments(message: types.Message, state: FSMContext):
         return
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except Exception as e:
         if "429" in str(e):
             await message.answer("⚠️ Google Sheets limiti tugadi. 1–2 daqiqa kutib qayta urinib ko'ring.")
@@ -83,7 +83,7 @@ async def callback_broker_recent(callback: types.CallbackQuery):
     await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...")
     try:
         sheet_service = get_sheet_service()
-        all_sheets = sheet_service.get_all_sheet_names(company)
+        all_sheets = sheet_service.get_last_n_week_sheets(n=20, company=company)
     except PermissionError:
         await callback.message.edit_text(
             "❌ Google Sheetga ruxsat yo'q. Tanlangan load uchun sheet "

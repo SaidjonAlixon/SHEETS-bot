@@ -34,8 +34,14 @@ def _get_company_keys():
 
 COMPANY_SHEET_KEYS = _get_company_keys()
 
-# Load board: Company Driver settlement PDF dagi Rate (Gross) bilan solishtiriladigan ustun (1=A, 12=L, ...)
-LOAD_BOARD_RATE_COL = int(os.getenv("LOAD_BOARD_RATE_COL", "11"))
+# Haftalik Load Board layout (TYPE | DRIVER | BROKER | LOAD# | PU DATE | ... | RATE | ... | STATUS | INVOICED | ... | BROKER PAID)
+LOAD_BOARD_DATA_START_ROW = int(os.getenv("LOAD_BOARD_DATA_START_ROW", "2"))  # 1-qator sarlavha
+LOAD_BOARD_LOAD_COL = int(os.getenv("LOAD_BOARD_LOAD_COL", "4"))  # D = LOAD #
+LOAD_BOARD_STATUS_COL = int(os.getenv("LOAD_BOARD_STATUS_COL", "15"))  # O
+LOAD_BOARD_INVOICED_COL = int(os.getenv("LOAD_BOARD_INVOICED_COL", "16"))  # P
+LOAD_BOARD_BROKER_PAID_COL = int(os.getenv("LOAD_BOARD_BROKER_PAID_COL", "18"))  # R
+LOAD_BOARD_RATE_COL = int(os.getenv("LOAD_BOARD_RATE_COL", "11"))  # K = RATE
+LOAD_BOARD_DRIVER_COL = int(os.getenv("LOAD_BOARD_DRIVER_COL", "2"))  # B = DRIVER NAME
 
 # Database Config (DATABASE_URL yoki alohida parametrlar)
 DATABASE_URL = os.getenv("DATABASE_URL")

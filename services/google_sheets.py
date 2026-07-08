@@ -16,6 +16,26 @@ _sheet_names_cache: dict[tuple, list] = {}
 _sheet_names_cache_time: dict[tuple, float] = {}
 CACHE_SEC = 180  # List nomlari cache (API tejash)
 
+# Haftalik sheet layout (config.py dan)
+def _lb_start_row():
+    return getattr(config, "LOAD_BOARD_DATA_START_ROW", 2)
+
+def _lb_load_cols():
+    col = getattr(config, "LOAD_BOARD_LOAD_COL", 4)
+    return (col,)
+
+def _lb_status_col():
+    return getattr(config, "LOAD_BOARD_STATUS_COL", 15)
+
+def _lb_invoiced_col():
+    return getattr(config, "LOAD_BOARD_INVOICED_COL", 16)
+
+def _lb_broker_paid_col():
+    return getattr(config, "LOAD_BOARD_BROKER_PAID_COL", 18)
+
+def _lb_driver_col():
+    return getattr(config, "LOAD_BOARD_DRIVER_COL", 2)
+
 def get_sheet_service():
     """Lazy init - faqat kerak bo'lganda yaratiladi. 429 da retry."""
     global _sheet_service_instance
@@ -292,19 +312,57 @@ class GoogleSheetService:
             letters = chr(65 + r) + letters
         return letters
 
+    @staticmethod
+    def _is_skippable_load_row(load_val, rate_val=None):
+        """Sarlavha, TOTALS yoki bo'sh qatorlarni o'tkazib yuborish."""
+        if load_val is None:
+            return True
+        s = str(load_val).replace("\xa0", " ").strip()
+        if not s or s in ("-", "—"):
+            return True
+        low = s.lower()
+        if low in ("load #", "load", "load number", "load/po #"):
+            return True
+        if low.startswith("totals"):
+            return True
+        if rate_val is not None:
+            r = str(rate_val).replace("\xa0", " ").strip().lower()
+            if r.startswith("totals"):
+                return True
+        # PU/DEL DATE noto'g'ri LOAD ustuniga tushmasin
+        if re.match(r"^\d{1,2}\.\d{1,2}(\.\d{2,4})?$", s):
+            return True
+        return False
+
+    def _load_row_is_valid(self, load_val, col_map=None, row_idx=0, start_row=None):
+        """Qator yuk qatori ekanini tekshiradi (TOTALS va sarlavhani chiqaradi)."""
+        rate_val = None
+        if col_map is not None:
+            rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
+            rate_vals = col_map.get(rate_col, [])
+            if row_idx < len(rate_vals):
+                rate_val = rate_vals[row_idx]
+        return not self._is_skippable_load_row(load_val, rate_val)
+
     def get_load_row_index(
-        self, sheet_name, company=None, start_row=17, load_cols=(4, 5, 7)
+        self, sheet_name, company=None, start_row=None, load_cols=None
     ):
         """
         Bitta batch_get bilan LOAD ustunlarini o'qiydi; normalize kalit -> qator.
         Ko'p trip tekshiruvida API tejash uchun.
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return {}
         try:
+            rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
+            cols_to_read = sorted(set(load_cols) | {rate_col})
             col_map = self._get_columns_from_start(
-                sheet, list(load_cols), start_row=start_row
+                sheet, list(cols_to_read), start_row=start_row
             )
         except Exception as e:
             print(f"get_load_row_index: {e}")
@@ -312,7 +370,7 @@ class GoogleSheetService:
         index = {}
         for col in load_cols:
             for i, val in enumerate(col_map.get(col, [])):
-                if str(val).strip().lower() == "load #":
+                if not self._load_row_is_valid(val, col_map, i):
                     continue
                 row_num = start_row + i
                 for key in self.split_load_cell_tokens(val):
@@ -322,42 +380,56 @@ class GoogleSheetService:
                         index[key] = row_num
         return index
 
-    def find_load_row(self, load_number, sheet_name, load_col=None, company=None):
+    def find_load_row(self, load_number, sheet_name, load_col=None, company=None, start_row=None, load_cols=None):
         """
-        LOAD # ustuni bo'yicha Load Numberni qidiradi.
-        D, keyin E, keyin G. Bitta batch_get — alohida col_values emas.
+        LOAD # ustuni bo'yicha Load Numberni qidiradi (D ustun).
+        Bitta batch_get — alohida col_values emas.
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return None
         try:
             target = self._normalize_load_num(load_number)
-            cols = tuple(c for c in ((load_col,) if load_col else (4, 5, 7)) if c is not None)
-            col_map = self._get_columns_from_start(sheet, list(cols), start_row=17)
+            cols = tuple(c for c in ((load_col,) if load_col else load_cols) if c is not None)
+            rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
+            cols_to_read = sorted(set(cols) | {rate_col})
+            col_map = self._get_columns_from_start(sheet, list(cols_to_read), start_row=start_row)
             for col in cols:
                 load_numbers = col_map.get(col, [])
                 for i, val in enumerate(load_numbers):
+                    if not self._load_row_is_valid(val, col_map, i):
+                        continue
                     toks = self.split_load_cell_tokens(val)
                     if not toks:
                         toks = [self._normalize_load_num(val)]
                     for tok in toks:
                         if tok and tok == target:
-                            return 17 + i
+                            return start_row + i
             return None
         except Exception as e:
             print(f"Error finding load: {e}")
             return None
 
     def get_date_sheet_names(self, company=None):
-        """MM.DD-MM.DD formatidagi sheet nomlari. Bo'sh bo'lsa - barcha sheetlar."""
+        """MM.DD-MM.DD formatidagi haftalik sheet nomlari."""
         result = []
         range_re = re.compile(r'(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})')
+        skip_tabs = {"dashboard", "drivers&dispatch", "drivers & dispatch", "drivers and dispatch"}
         for name in self.get_all_sheet_names(company):
+            low = name.strip().lower()
+            if low in skip_tabs:
+                continue
             if range_re.search(name):
                 result.append(name)
-        # Agar date format bo'lmasa (masalan "Drivers & Dispatch") - barcha sheetlardan qidirish
         if not result:
-            result = [n for n in self.get_all_sheet_names(company) if n.lower() != 'dashboard']
+            result = [
+                n for n in self.get_all_sheet_names(company)
+                if n.strip().lower() not in skip_tabs
+            ]
         return result
 
     def get_last_n_week_sheets(self, n=10, company=None):
@@ -388,11 +460,13 @@ class GoogleSheetService:
         sorted_names = sorted(names, key=_sort_key, reverse=True)
         return sorted_names[:n]
 
-    def _get_columns_from_start(self, sheet, cols, start_row=17):
+    def _get_columns_from_start(self, sheet, cols, start_row=None):
         """
         Bir nechta ustunni bitta API chaqiruv bilan o'qiydi.
         Qaytaradi: {col_num: [values...]} (start_row dan boshlab).
         """
+        if start_row is None:
+            start_row = _lb_start_row()
         col_letters = {}
         for col in cols:
             # 1 -> A, 26 -> Z
@@ -411,12 +485,19 @@ class GoogleSheetService:
             result[col] = [row[0] if row else "" for row in vals_2d]
         return result
 
-    def update_factoring_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+    def update_factoring_across_sheets(self, sheet_names, parsed_data, load_cols=None, start_row=None, company=None):
         """
         Bir nechta sheetda Load # ni qidirib, topilganiga summani yozadi.
         sheet_names: qidiriladigan sheetlar (eng yangi 10 hafta).
         Qaytaradi: (updated, skipped, not_found, results).
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
+        status_col = _lb_status_col()
+        invoiced_col = _lb_invoiced_col()
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         if not sheet_names or not parsed_data:
             return (0, 0, len(parsed_data), [])
 
@@ -428,19 +509,21 @@ class GoogleSheetService:
                 continue
             sheet_cache[sn] = sheet
             try:
-                needed_cols = sorted(set(load_cols) | {16})
+                needed_cols = sorted(set(load_cols) | {invoiced_col, rate_col})
                 col_map = self._get_columns_from_start(sheet, needed_cols, start_row=start_row)
                 max_len = max((len(v) for v in col_map.values()), default=0)
             except Exception:
                 continue
             for row_num in range(start_row, start_row + max_len):
+                idx = row_num - start_row
                 for col in load_cols:
                     vals = col_map.get(col, [])
-                    idx = row_num - start_row
                     val = vals[idx] if idx < len(vals) else ""
+                    if not self._load_row_is_valid(val, col_map, idx):
+                        continue
                     norm = self._normalize_load_num(val)
                     if norm and norm not in load_to_sheet_row:
-                        inv_vals = col_map.get(16, [])
+                        inv_vals = col_map.get(invoiced_col, [])
                         inv_cur = inv_vals[idx] if idx < len(inv_vals) else ""
                         load_to_sheet_row[norm] = (sn, row_num, inv_cur)
                         break
@@ -479,8 +562,8 @@ class GoogleSheetService:
                     cells_by_sheet[sheet_name] = []
                 if sheet_name not in pending_by_sheet:
                     pending_by_sheet[sheet_name] = []
-                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=16, value=amount))
-                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=15, value="Invoiced"))
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=invoiced_col, value=amount))
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=status_col, value="Invoiced"))
                 updated += 1
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Sheet": sheet_name, "Status": "UPDATED"})
                 pending_by_sheet[sheet_name].append((len(results) - 1, row_num))
@@ -510,12 +593,18 @@ class GoogleSheetService:
 
         return (updated, skipped, not_found, results)
 
-    def update_broker_payment_across_sheets(self, sheet_names, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+    def update_broker_payment_across_sheets(self, sheet_names, parsed_data, load_cols=None, start_row=None, company=None):
         """
         Oxirgi 10 hafta sheetlarida Load # ni qidirib, R (BROKER PAID) ga yozadi.
         Tezlik uchun faqat BROKER PAID (R) yangilanadi; STATUS alohida yozilmaydi.
         parsed_data: [{'load_number': '...', 'amount': summa}, ...] — bitta load uchun bitta, umumiy summa.
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
+        broker_paid_col = _lb_broker_paid_col()
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         if not sheet_names or not parsed_data:
             return (0, 0, len(parsed_data) if parsed_data else 0, [])
 
@@ -529,7 +618,7 @@ class GoogleSheetService:
                 continue
             sheet_cache[sn] = sheet
             try:
-                needed_cols = sorted(set(load_cols) | {18})
+                needed_cols = sorted(set(load_cols) | {broker_paid_col, rate_col})
                 col_map = self._get_columns_from_start(sheet, needed_cols, start_row=start_row)
                 max_len = max((len(v) for v in col_map.values()), default=0)
             except Exception:
@@ -540,9 +629,11 @@ class GoogleSheetService:
                 for col in load_cols:
                     vals = col_map.get(col, [])
                     val = vals[idx] if idx < len(vals) else ""
+                    if not self._load_row_is_valid(val, col_map, idx):
+                        continue
                     norm = self._normalize_load_num(val)
                     if norm and norm not in load_to_sheet_row:
-                        paid_vals = col_map.get(18, [])
+                        paid_vals = col_map.get(broker_paid_col, [])
                         paid_cur = paid_vals[idx] if idx < len(paid_vals) else ""
                         load_to_sheet_row[norm] = (sn, row_num, paid_cur)
                         break
@@ -585,7 +676,7 @@ class GoogleSheetService:
                     cells_by_sheet[sheet_name] = []
                 if sheet_name not in pending_by_sheet:
                     pending_by_sheet[sheet_name] = []
-                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=18, value=amount))
+                cells_by_sheet[sheet_name].append(Cell(row=row_num, col=broker_paid_col, value=amount))
                 updated += 1
                 results.append({"Load #": load_num, "Check Amount": amount, "Sheet": sheet_name, "Status": "FOUND"})
                 pending_by_sheet[sheet_name].append((len(results) - 1, row_num, amount))
@@ -635,41 +726,54 @@ class GoogleSheetService:
 
     def update_factoring(self, row, invoiced_amount, sheet_name, company=None):
         """
-        P (16) ustuniga INVOICED AMOUNT yozish
-        O (15) ustuniga STATUS = 'Invoiced' yozish
+        P (INVOICED AMOUNT) va O (STATUS = Invoiced) ustunlariga yozish.
         """
         if invoiced_amount is None:
             return False
+        invoiced_col = _lb_invoiced_col()
+        status_col = _lb_status_col()
         sheet = self.get_load_board(sheet_name, company)
         if not sheet: return False
         
-        current_amount = sheet.cell(row, 16).value
+        current_amount = sheet.cell(row, invoiced_col).value
         if self._is_empty_or_zero(current_amount):
-            sheet.update_cell(row, 16, invoiced_amount)
-            sheet.update_cell(row, 15, "Invoiced")
+            sheet.update_cell(row, invoiced_col, invoiced_amount)
+            sheet.update_cell(row, status_col, "Invoiced")
             return True
         return False
 
-    def update_factoring_batch(self, sheet_name, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+    def update_factoring_batch(self, sheet_name, parsed_data, load_cols=None, start_row=None, company=None):
         """
         Bir marta o'qib, batch yozish — Fuel/Toll kabi tez.
         parsed_data: [{"load_number": "...", "amount": ...}, ...]
         Qaytaradi: (updated, skipped, not_found, results) — results har biri uchun status.
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
+        status_col = _lb_status_col()
+        invoiced_col = _lb_invoiced_col()
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return (0, 0, len(parsed_data), [])
 
+        all_rows = self._retry_on_429(sheet.get_all_values)
         load_to_row = {}
-        for col in load_cols:
-            vals = sheet.col_values(col)
-            for i in range(start_row - 1, len(vals)):
-                norm = self._normalize_load_num(vals[i])
-                if norm and norm not in load_to_row:
-                    load_to_row[norm] = i + 1
-
-        inv_vals = sheet.col_values(16)
-        status_vals = sheet.col_values(15)
+        inv_vals = []
+        for i in range(start_row - 1, len(all_rows)):
+            row = all_rows[i] if i < len(all_rows) else []
+            load_val = row[_lb_load_cols()[0] - 1] if len(row) >= _lb_load_cols()[0] else ""
+            rate_val = row[rate_col - 1] if len(row) >= rate_col else ""
+            if self._is_skippable_load_row(load_val, rate_val):
+                inv_vals.append("")
+                continue
+            norm = self._normalize_load_num(load_val)
+            if norm and norm not in load_to_row:
+                load_to_row[norm] = i + 1
+            inv_val = row[invoiced_col - 1] if len(row) >= invoiced_col else ""
+            inv_vals.append(inv_val)
 
         cells = []
         updated = 0
@@ -691,10 +795,10 @@ class GoogleSheetService:
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Status": "LOAD NOT FOUND"})
                 continue
 
-            inv_cur = inv_vals[row_num - 1] if row_num - 1 < len(inv_vals) else ""
+            inv_cur = inv_vals[row_num - start_row] if row_num >= start_row and row_num - start_row < len(inv_vals) else ""
             if self._is_empty_or_zero(inv_cur):
-                cells.append(Cell(row=row_num, col=16, value=amount))
-                cells.append(Cell(row=row_num, col=15, value="Invoiced"))  # STATUS dropdown: Booked, Invoiced, Broker paid, ...
+                cells.append(Cell(row=row_num, col=invoiced_col, value=amount))
+                cells.append(Cell(row=row_num, col=status_col, value="Invoiced"))
                 updated += 1
                 results.append({"Load/PO #": load_num, "Invoice Amount": amount, "Status": "UPDATED"})
             else:
@@ -717,26 +821,35 @@ class GoogleSheetService:
 
     def update_broker_payment(self, row, paid_amount, sheet_name, company=None):
         """
-        R (18) ustuniga BROKER PAID, O (15) ustuniga STATUS = 'Broker paid' yozish.
-        Xls dagi Invoice Amount qiymati shu yerga yoziladi.
+        R (BROKER PAID) va O (STATUS = Broker paid) ustunlariga yozish.
         """
         if paid_amount is None:
             return False
+        broker_paid_col = _lb_broker_paid_col()
+        status_col = _lb_status_col()
         sheet = self.get_load_board(sheet_name, company)
         if not sheet: return False
         
-        current_paid = sheet.cell(row, 18).value  # R ustuni - BROKER PAID
+        current_paid = sheet.cell(row, broker_paid_col).value
         if self._is_empty_or_zero(current_paid):
-            sheet.update_cell(row, 18, paid_amount)
-            sheet.update_cell(row, 15, "Broker paid")  # STATUS dropdown dan
+            sheet.update_cell(row, broker_paid_col, paid_amount)
+            sheet.update_cell(row, status_col, "Broker paid")
             return True
         return False
 
-    def update_broker_payment_batch(self, sheet_name, parsed_data, load_cols=(4, 5, 7), start_row=17, company=None):
+    def update_broker_payment_batch(self, sheet_name, parsed_data, load_cols=None, start_row=None, company=None):
         """
         Bir marta o'qib, batch yozish — Factoring/Fuel/Toll kabi tez.
         get_all_values() bilan 1 API chaqiruv — 4 ta col_values o'rniga.
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
+        status_col = _lb_status_col()
+        broker_paid_col = _lb_broker_paid_col()
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
+        load_col = load_cols[0]
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return (0, 0, len(parsed_data), [])
@@ -746,13 +859,15 @@ class GoogleSheetService:
         paid_vals = []
         for i in range(start_row - 1, len(all_rows)):
             row = all_rows[i] if i < len(all_rows) else []
-            for col in load_cols:
-                val = row[col - 1] if len(row) >= col else ""
-                norm = self._normalize_load_num(val)
-                if norm and norm not in load_to_row:
-                    load_to_row[norm] = i + 1
-                    break
-            paid_val = row[17] if len(row) >= 18 else ""
+            load_val = row[load_col - 1] if len(row) >= load_col else ""
+            rate_val = row[rate_col - 1] if len(row) >= rate_col else ""
+            if self._is_skippable_load_row(load_val, rate_val):
+                paid_vals.append("")
+                continue
+            norm = self._normalize_load_num(load_val)
+            if norm and norm not in load_to_row:
+                load_to_row[norm] = i + 1
+            paid_val = row[broker_paid_col - 1] if len(row) >= broker_paid_col else ""
             paid_vals.append(paid_val)
 
         cells = []
@@ -777,8 +892,8 @@ class GoogleSheetService:
 
             paid_cur = paid_vals[row_num - start_row] if (row_num >= start_row and row_num - start_row < len(paid_vals)) else ""
             if self._is_empty_or_zero(paid_cur):
-                cells.append(Cell(row=row_num, col=18, value=broker_amount))
-                cells.append(Cell(row=row_num, col=15, value="Broker paid"))
+                cells.append(Cell(row=row_num, col=broker_paid_col, value=broker_amount))
+                cells.append(Cell(row=row_num, col=status_col, value="Broker paid"))
                 updated += 1
                 results.append({"Load #": load_num, "Invoice Amount": broker_amount, "Broker Amount": broker_amount, "Date": item.get("date"), "Status": f"UPDATED ({sheet_name})"})
             else:
@@ -789,8 +904,14 @@ class GoogleSheetService:
             sheet.update_cells(cells)
         return (updated, skipped, not_found, results)
 
-    def get_load_to_row_map(self, sheet_name, load_cols=(4, 5, 7), start_row=17, company=None):
+    def get_load_to_row_map(self, sheet_name, load_cols=None, start_row=None, company=None):
         """Sheetdagi load_number -> row_num xaritasi. 1 API — get_all_values."""
+        if start_row is None:
+            start_row = _lb_start_row()
+        if load_cols is None:
+            load_cols = _lb_load_cols()
+        load_col = load_cols[0]
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return {}
@@ -798,12 +919,13 @@ class GoogleSheetService:
         load_to_row = {}
         for i in range(start_row - 1, len(all_rows)):
             row = all_rows[i] if i < len(all_rows) else []
-            for col in load_cols:
-                val = row[col - 1] if len(row) >= col else ""
-                norm = self._normalize_load_num(val)
-                if norm and norm not in load_to_row:
-                    load_to_row[norm] = i + 1
-                    break
+            load_val = row[load_col - 1] if len(row) >= load_col else ""
+            rate_val = row[rate_col - 1] if len(row) >= rate_col else ""
+            if self._is_skippable_load_row(load_val, rate_val):
+                continue
+            norm = self._normalize_load_num(load_val)
+            if norm and norm not in load_to_row:
+                load_to_row[norm] = i + 1
         return load_to_row
 
     def add_fuel_expense(self, data):
@@ -965,37 +1087,52 @@ class GoogleSheetService:
 
     def get_row_display(self, row, sheet_name, company=None):
         """Bir qator ma'lumotini ko'rsatish uchun. LOAD #, Driver, PU DATE, INVOICED, BROKER PAID, STATUS."""
+        load_col = _lb_load_cols()[0]
+        driver_col = _lb_driver_col()
+        pu_date_col = 5  # E
+        invoiced_col = _lb_invoiced_col()
+        broker_paid_col = _lb_broker_paid_col()
+        status_col = _lb_status_col()
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return None
         try:
             return {
-                'load_number': sheet.cell(row, 4).value,
+                'load_number': sheet.cell(row, load_col).value,
                 'driver': self._driver_name_for_load_row(sheet, row),
-                'pu_date': sheet.cell(row, 5).value,
-                'invoiced': sheet.cell(row, 16).value,
-                'broker_paid': sheet.cell(row, 18).value,
-                'status': sheet.cell(row, 15).value,
+                'pu_date': sheet.cell(row, pu_date_col).value,
+                'invoiced': sheet.cell(row, invoiced_col).value,
+                'broker_paid': sheet.cell(row, broker_paid_col).value,
+                'status': sheet.cell(row, status_col).value,
             }
         except Exception as e:
             print(f"get_row_display error: {e}")
             return None
 
     def get_recent_loads(self, sheet_name, limit=15, company=None):
-        """Sheetdan oxirgi N ta yuk (LOAD # bo'lgan qatorlar). Data 17-qatordan boshlanadi."""
+        """Sheetdan oxirgi N ta yuk (LOAD # bo'lgan qatorlar)."""
+        start_row = _lb_start_row()
+        load_col = _lb_load_cols()[0]
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return []
         try:
-            load_col = 4
-            load_vals = sheet.col_values(load_col)
-            if len(load_vals) <= 16:
+            col_map = self._get_columns_from_start(
+                sheet, [load_col, rate_col], start_row=start_row
+            )
+            load_vals = col_map.get(load_col, [])
+            rate_vals = col_map.get(rate_col, [])
+            if not load_vals:
                 return []
             rows = []
-            for i in range(16, len(load_vals)):
-                val = self._normalize_load_num(load_vals[i])
-                if val and val.lower() != 'load #':
-                    rows.append((i + 1, val))
+            for i, val in enumerate(load_vals):
+                rate_val = rate_vals[i] if i < len(rate_vals) else None
+                if self._is_skippable_load_row(val, rate_val):
+                    continue
+                norm = self._normalize_load_num(val)
+                if norm:
+                    rows.append((start_row + i, norm))
             rows = rows[-limit:]
             return [self.get_row_display(r[0], sheet_name, company) for r in rows]
         except Exception as e:
@@ -1014,6 +1151,11 @@ class GoogleSheetService:
 
     def get_sheet_summary(self, sheet_name, company=None):
         """List bo'yicha hisobot: yozuvlar soni, jami INVOICED, jami BROKER PAID."""
+        start_row = _lb_start_row()
+        load_col = _lb_load_cols()[0]
+        invoiced_col = _lb_invoiced_col()
+        broker_paid_col = _lb_broker_paid_col()
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         sheet = self.get_load_board(sheet_name, company)
         if not sheet:
             return None
@@ -1021,13 +1163,18 @@ class GoogleSheetService:
             count = 0
             total_inv = 0.0
             total_paid = 0.0
-            load_vals = sheet.col_values(4)
-            for i in range(16, len(load_vals)):
-                if not self._normalize_load_num(load_vals[i]) or str(load_vals[i]).lower() == 'load #':
+            all_rows = self._retry_on_429(sheet.get_all_values)
+            for i in range(start_row - 1, len(all_rows)):
+                row = all_rows[i] if i < len(all_rows) else []
+                load_val = row[load_col - 1] if len(row) >= load_col else ""
+                rate_val = row[rate_col - 1] if len(row) >= rate_col else ""
+                if self._is_skippable_load_row(load_val, rate_val):
+                    continue
+                if not self._normalize_load_num(load_val):
                     continue
                 count += 1
-                inv = sheet.cell(i + 1, 16).value
-                paid = sheet.cell(i + 1, 18).value
+                inv = row[invoiced_col - 1] if len(row) >= invoiced_col else ""
+                paid = row[broker_paid_col - 1] if len(row) >= broker_paid_col else ""
                 if inv:
                     try:
                         total_inv += float(str(inv).replace('$', '').replace(',', '').strip())
@@ -1056,10 +1203,12 @@ class GoogleSheetService:
         if not sheet: return None
         
         try:
-            # P=16 (Invoiced), R=18 (Broker Paid), O=15 (Status)
-            invoiced = sheet.cell(row, 16).value
-            broker_paid = sheet.cell(row, 18).value
-            status = sheet.cell(row, 15).value
+            invoiced_col = _lb_invoiced_col()
+            broker_paid_col = _lb_broker_paid_col()
+            status_col = _lb_status_col()
+            invoiced = sheet.cell(row, invoiced_col).value
+            broker_paid = sheet.cell(row, broker_paid_col).value
+            status = sheet.cell(row, status_col).value
             
             # Helper function to clean amount strings (e.g. "$1,200.00" -> 1200.0)
             def clean_amount(val):
@@ -1084,12 +1233,15 @@ class GoogleSheetService:
         self,
         sheet,
         row: int,
-        data_start_row: int = 17,
+        data_start_row=None,
         b_cell_value=None,
     ) -> str:
         """
         Haydovchi ismi faqat B ustunidan (DRIVER NAME). Merged B: bitta batch_get yoki b_cell_value.
         """
+        if data_start_row is None:
+            data_start_row = _lb_start_row()
+        driver_col = _lb_driver_col()
         skip = {
             "load #",
             "load",
@@ -1127,7 +1279,7 @@ class GoogleSheetService:
             if b_cell_value is not None:
                 b = clean(b_cell_value)
             else:
-                b = clean(sheet.cell(row, 2).value)
+                b = clean(sheet.cell(row, driver_col).value)
             if looks_ok(b):
                 return b
         except Exception:
@@ -1136,7 +1288,7 @@ class GoogleSheetService:
         if row <= data_start_row:
             return ""
         try:
-            rng = f"B{data_start_row}:B{row - 1}"
+            rng = f"{self._a1_column(driver_col)}{data_start_row}:{self._a1_column(driver_col)}{row - 1}"
             block = self._retry_on_429(sheet.batch_get, [rng])
             if not block or not block[0]:
                 return ""
@@ -1169,11 +1321,15 @@ class GoogleSheetService:
                 return 0.0
 
         try:
-            rate_col = max(1, int(getattr(config, "LOAD_BOARD_RATE_COL", 12)))
+            rate_col = max(1, int(getattr(config, "LOAD_BOARD_RATE_COL", 11)))
+            load_col = _lb_load_cols()[0]
+            driver_col = _lb_driver_col()
             rl = self._a1_column(rate_col)
+            dl = self._a1_column(load_col)
+            bl = self._a1_column(driver_col)
             cells = self._retry_on_429(
                 sheet.batch_get,
-                [f"B{row}", f"D{row}", f"{rl}{row}"],
+                [f"{bl}{row}", f"{dl}{row}", f"{rl}{row}"],
             )
 
             def _bgv(i: int):
@@ -1218,7 +1374,7 @@ class GoogleSheetService:
         sheet_name: str,
         driver_name: str,
         company=None,
-        start_row: int = 17,
+        start_row=None,
         max_rows: int = 800,
     ):
         """
@@ -1227,6 +1383,11 @@ class GoogleSheetService:
           first_row, matched_rows, sheet_name, last_resolved_name
         }
         """
+        if start_row is None:
+            start_row = _lb_start_row()
+        driver_col = _lb_driver_col()
+        load_col = _lb_load_cols()[0]
+        rate_col = getattr(config, "LOAD_BOARD_RATE_COL", 11)
         if not sheet_name or not str(driver_name or "").strip():
             return None
         sheet = self.get_load_board(sheet_name, company)
@@ -1269,26 +1430,47 @@ class GoogleSheetService:
             return True
 
         end_row = start_row + max_rows - 1
+        driver_letter = self._a1_column(driver_col)
+        load_letter = self._a1_column(load_col)
+        rate_letter = self._a1_column(rate_col)
         try:
-            block = self._retry_on_429(sheet.batch_get, [f"B{start_row}:B{end_row}"])
+            blocks = self._retry_on_429(
+                sheet.batch_get,
+                [
+                    f"{driver_letter}{start_row}:{driver_letter}{end_row}",
+                    f"{load_letter}{start_row}:{load_letter}{end_row}",
+                    f"{rate_letter}{start_row}:{rate_letter}{end_row}",
+                ],
+            )
         except Exception as e:
             print(f"find_driver_rows_on_load_sheet batch_get: {e}")
             return None
-        if not block or not block[0]:
+        if not blocks or not blocks[0]:
             return None
 
-        rows_flat = block[0]
+        driver_rows = blocks[0]
+        load_rows = blocks[1] if len(blocks) > 1 else []
+        rate_rows = blocks[2] if len(blocks) > 2 else []
         last_resolved = ""
         matched: list[int] = []
 
-        for i, cell in enumerate(rows_flat):
+        for i, cell in enumerate(driver_rows):
             raw = cell[0] if cell and len(cell) > 0 else ""
             b = clean(raw)
             if looks_ok(b):
                 last_resolved = b
             row_num = start_row + i
-            if last_resolved and self._driver_display_names_match(driver_name, last_resolved):
-                matched.append(row_num)
+            if not last_resolved or not self._driver_display_names_match(driver_name, last_resolved):
+                continue
+            load_val = ""
+            if i < len(load_rows) and load_rows[i]:
+                load_val = load_rows[i][0] if load_rows[i] else ""
+            rate_val = ""
+            if i < len(rate_rows) and rate_rows[i]:
+                rate_val = rate_rows[i][0] if rate_rows[i] else ""
+            if self._is_skippable_load_row(load_val, rate_val) and not self._normalize_load_num(load_val):
+                continue
+            matched.append(row_num)
 
         if not matched:
             return None
