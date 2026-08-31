@@ -88,10 +88,10 @@ def match_fuel_four_columns(headers: list[str]) -> tuple[int, int, int, int] | N
     return None
 
 
-def find_fuel_transaction_header_map(df) -> tuple[int, int, int, int, int] | None:
+def find_fuel_transaction_header_map(df) -> tuple[int, int, int, int, int, int | None] | None:
     """
     Excel jadvalida (header=None) ustun nomlari qatorini qidiradi.
-    Qaytaradi: (header_row_index, card_col, date_col, disc_col, amt_col) yoki None.
+    Qaytaradi: (header_row_index, card_col, date_col, disc_col, amt_col, driver_id_col) yoki None.
     """
     import pandas as pd
     if df is None or df.empty:
@@ -105,7 +105,8 @@ def find_fuel_transaction_header_map(df) -> tuple[int, int, int, int, int] | Non
         m = match_fuel_four_columns(headers)
         if m:
             ci, di, qi, ai = m
-            return hr, ci, di, qi, ai
+            did = find_fuel_driver_id_col(headers, ncols)
+            return hr, ci, di, qi, ai, did
     return None
 
 
@@ -307,14 +308,42 @@ def parse_toll_amount_positive_only(val):
         return None
 
 
-def find_fuel_columns_from_named_dataframe(df) -> tuple[int, int, int, int] | None:
+def find_fuel_driver_id_col(headers: list[str], ncols: int) -> int | None:
+    """Excel: Driver ID ustuni (sarlavha yoki M=12 indeks)."""
+    for j, h in enumerate(headers):
+        if "driver" in h and "id" in h:
+            return j
+    if ncols > 12:
+        return 12
+    return None
+
+
+def fuel_driver_id_lookup_col(sheet_name: str) -> int:
+    """Deduction sheet: Owner Operators=C(3), Company Drivers=D(4)."""
+    low = str(sheet_name or "").strip().lower()
+    if "company driver" in low:
+        return 4
+    return 3
+
+
+def normalize_driver_id_str(v) -> str:
+    from services.google_sheets import get_sheet_service
+    return get_sheet_service().normalize_driver_id(v)
+
+
+def find_fuel_columns_from_named_dataframe(df) -> tuple[int, int, int, int, int | None] | None:
     """pd.read_excel(header=0) — ustun nomlari Card #, Tran Date, ... bo'lsa."""
     if df is None or df.empty:
         return None
     headers = []
     for c in df.columns:
         headers.append(_fuel_norm_header(_flatten_column_name(c)))
-    return match_fuel_four_columns(headers)
+    m = match_fuel_four_columns(headers)
+    if not m:
+        return None
+    ci, di, qi, ai = m
+    did = find_fuel_driver_id_col(headers, len(headers))
+    return ci, di, qi, ai, did
 
 
 def autopick_fuel_expense_tab(sheet_candidates: list, fuel_entries: list) -> str | None:
@@ -408,7 +437,8 @@ async def apply_fuel_named_week_to_sheet(
     end_date = date(end_year, end_month, end_day)
 
     sheet_service = get_sheet_service()
-    card_totals = {}
+    driver_id_col = fuel_driver_id_lookup_col(sheet_name)
+    driver_totals = {}
     for item in fuel_entries:
         try:
             item_date = datetime.fromisoformat(item["date"]).date()
@@ -416,43 +446,45 @@ async def apply_fuel_named_week_to_sheet(
             continue
         if not (start_date <= item_date <= end_date):
             continue
-        card = str(item.get("card", "")).strip()
-        if not card:
+        driver_id = str(item.get("driver_id", "")).strip()
+        if not driver_id:
             continue
         fuel_sum = float(item.get("fuel", 0.0) or 0.0)
         discount_sum = float(item.get("discount", 0.0) or 0.0)
-        if card not in card_totals:
-            card_totals[card] = [0.0, 0.0]
-        card_totals[card][0] += fuel_sum
-        card_totals[card][1] += discount_sum
+        if driver_id not in driver_totals:
+            driver_totals[driver_id] = [0.0, 0.0]
+        driver_totals[driver_id][0] += fuel_sum
+        driver_totals[driver_id][1] += discount_sum
 
-    if not card_totals:
+    if not driver_totals:
         await status_msg.edit_text(f"List <b>{sheet_name}</b> oralig'ida mos yozuv topilmadi.")
         await state.set_state(BotStates.Fuel)
         return True
 
-    card_totals_tuple = {k: (v[0], v[1]) for k, v in card_totals.items()}
-    updated, skipped, missing_count, missing_cards = sheet_service.update_fuel_toll_expenses(
+    driver_totals_tuple = {k: (v[0], v[1]) for k, v in driver_totals.items()}
+    updated, skipped, missing_count, missing_ids = sheet_service.update_fuel_toll_expenses(
         sheet_name,
-        card_totals_tuple,
+        driver_totals_tuple,
         fuel_col=5,
         discount_col=6,
+        card_col=driver_id_col,
+        match_by="driver_id",
         company=company,
     )
 
     report_rows = []
-    missing_set = set(str(x) for x in (missing_cards or []))
+    missing_set = set(str(x) for x in (missing_ids or []))
     week_label = f"{start_str}-{end_str}"
-    for card, (fuel_sum, discount_sum) in card_totals_tuple.items():
-        card_s = str(card)
+    for driver_id, (fuel_sum, discount_sum) in driver_totals_tuple.items():
+        did_s = str(driver_id)
         if (fuel_sum or 0) == 0 and (discount_sum or 0) == 0:
             continue
-        status = "TOPILMADI" if card_s in missing_set else "TOPILDI"
+        status = "TOPILMADI" if did_s in missing_set else "TOPILDI"
         report_rows.append(
             {
                 "Sheet": sheet_name,
                 "Week": week_label,
-                "Card": card_s,
+                "Driver ID": did_s,
                 "FuelSum": fuel_sum,
                 "DiscountSum": discount_sum,
                 "Status": status,
@@ -505,7 +537,8 @@ async def enter_fuel(message: types.Message, state: FSMContext):
     await state.set_state(BotStates.Fuel)
     await message.answer(
         "Excel (xlsx, xls) yuboring. Jadvalda <b>Card #</b>, <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> "
-        "sarlavhalari bo'lsa — bot ustunlarni o'zi topadi; hafta ro'yxati aniq bo'lsa, Google Sheetga avtomatik yozadi.",
+        "va <b>Driver ID</b> (M ustun) bo'lsa — bot Driver ID orqali Owner Operators (C) / Company Drivers (D) "
+        "sheetlarida qator topib yozadi.",
         reply_markup=expenses_menu,
     )
 
@@ -648,31 +681,38 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 except Exception:
                     return None
 
-            def fuel_rows_to_acc(df_part, ci, di, qi, ai):
-                """df_part — faqat ma'lumot qatorlari (sarlavhasiz)."""
+            def fuel_rows_to_acc(df_part, ci, di, qi, ai, driver_id_col=None):
+                """df_part — faqat ma'lumot qatorlari (sarlavhasiz). Driver ID bo'yicha yig'adi."""
                 acc = {}
-                seen_cards = set()
+                seen_driver_ids = set()
                 for r in range(len(df_part)):
                     row = df_part.iloc[r]
                     n = len(row)
+
                     def gc(j):
                         return row.iloc[j] if j < n else None
-                    card_val = normalize_card_str(gc(ci))
-                    if not card_val:
+
+                    driver_id = ""
+                    if driver_id_col is not None and driver_id_col < n:
+                        driver_id = normalize_driver_id_str(gc(driver_id_col))
+                    if not driver_id:
                         continue
-                    seen_cards.add(card_val)
+                    seen_driver_ids.add(driver_id)
                     trans_date = parse_fuel_tran_date(gc(di))
                     if trans_date is None:
                         continue
                     date_iso = trans_date.isoformat()
                     discount_sum = parse_money(gc(qi))
                     fuel_sum = parse_money(gc(ai))
-                    key = (card_val, date_iso)
+                    card_val = normalize_card_str(gc(ci)) if ci < n else ""
+                    key = (driver_id, date_iso)
                     if key not in acc:
-                        acc[key] = [0.0, 0.0]
+                        acc[key] = [0.0, 0.0, card_val]
                     acc[key][0] += fuel_sum
                     acc[key][1] += discount_sum
-                return acc, seen_cards
+                    if not acc[key][2] and card_val:
+                        acc[key][2] = card_val
+                return acc, seen_driver_ids
 
             try:
                 xls = pd.ExcelFile(io.BytesIO(content_bytes))
@@ -683,12 +723,12 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             last_progress = await message.answer("⏳ Fuel xlsx o‘qilmoqda...")
 
             entries_acc = {}
-            all_seen_cards = set()
+            all_seen_driver_ids = set()
             sheets_tried = []
             for sheet_name in xls.sheet_names:
                 sheets_tried.append(sheet_name)
                 acc = {}
-                seen_cards_local = set()
+                seen_driver_ids_local = set()
 
                 # A) Birinchi qator = ustun nomlari (Delo / EFS eksport — eng ko'p holat)
                 try:
@@ -698,9 +738,14 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 if df0 is not None and df0.shape[1] >= 4:
                     colmap = find_fuel_columns_from_named_dataframe(df0)
                     if colmap:
-                        ci, di, qi, ai = colmap
-                        acc, seen_cards_local = fuel_rows_to_acc(df0, ci, di, qi, ai)
-                        all_seen_cards.update(seen_cards_local)
+                        ci, di, qi, ai, did = colmap
+                        if did is None:
+                            did = find_fuel_driver_id_col(
+                                [_fuel_norm_header(_flatten_column_name(c)) for c in df0.columns],
+                                df0.shape[1],
+                            )
+                        acc, seen_driver_ids_local = fuel_rows_to_acc(df0, ci, di, qi, ai, did)
+                        all_seen_driver_ids.update(seen_driver_ids_local)
 
                 if acc:
                     entries_acc = acc
@@ -715,9 +760,14 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     continue
                 found = find_fuel_transaction_header_map(df)
                 if found:
-                    hr, ci, di, qi, ai = found
-                    acc, seen_cards_local = fuel_rows_to_acc(df.iloc[hr + 1 :], ci, di, qi, ai)
-                    all_seen_cards.update(seen_cards_local)
+                    hr, ci, di, qi, ai, did = found
+                    if did is None:
+                        did = find_fuel_driver_id_col(
+                            [_fuel_norm_header(df.iloc[hr, j]) for j in range(df.shape[1])],
+                            df.shape[1],
+                        )
+                    acc, seen_driver_ids_local = fuel_rows_to_acc(df.iloc[hr + 1 :], ci, di, qi, ai, did)
+                    all_seen_driver_ids.update(seen_driver_ids_local)
                 if acc:
                     entries_acc = acc
                     break
@@ -728,8 +778,8 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                     hint = "Fayl ichida varaq topilmadi."
                 else:
                     hint = (
-                        "Kerakli ustunlar topilmadi yoki yozuvlar o'qilmadi (sana/karta). "
-                        "Birinchi qatorda <b>Card #</b>, <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> bo'lsin; "
+                        "Kerakli ustunlar topilmadi yoki yozuvlar o'qilmadi (sana/driver id). "
+                        "Faylda <b>Driver ID</b> (M ustun), <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> bo'lsin; "
                         "faylni Excelda <b>.xlsx</b> qilib qayta saqlang (CSV emas)."
                     )
                 try:
@@ -741,8 +791,17 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 return
 
             fuel_entries = []
-            for (card, date_iso), (fuel_sum, discount_sum) in entries_acc.items():
-                fuel_entries.append({"card": card, "date": date_iso, "fuel": fuel_sum, "discount": discount_sum})
+            for (driver_id, date_iso), vals in entries_acc.items():
+                fuel_sum = vals[0] if len(vals) > 0 else 0.0
+                discount_sum = vals[1] if len(vals) > 1 else 0.0
+                card = vals[2] if len(vals) > 2 else ""
+                fuel_entries.append({
+                    "driver_id": driver_id,
+                    "card": card,
+                    "date": date_iso,
+                    "fuel": fuel_sum,
+                    "discount": discount_sum,
+                })
             expenses_sheet_names = sheet_service.get_expenses_all_sheet_names(company)
             owner_name = _find_sheet_by_alias(expenses_sheet_names, "Owner Operators")
             company_name = _find_sheet_by_alias(expenses_sheet_names, "Company Drivers")
@@ -756,7 +815,7 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
             await state.set_state(BotStates.FuelSheetSelect)
             await state.update_data(
                 fuel_entries=fuel_entries,
-                fuel_all_cards=sorted(all_seen_cards),
+                fuel_all_driver_ids=sorted(all_seen_driver_ids),
                 selected_company=company,
                 fuel_owner_company=[x for x in [owner_name, company_name] if x],
                 fuel_terminated=[x for x in [terminated_name] if x],
@@ -930,7 +989,7 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
     else:
         sheet_names = []
     fuel_entries = data.get("fuel_entries") or []
-    fuel_all_cards = data.get("fuel_all_cards") or []
+    fuel_all_driver_ids = data.get("fuel_all_driver_ids") or []
     if not sheet_names or not fuel_entries:
         await callback.message.edit_text("❌ Ma'lumotlar topilmadi. Qaytadan Fuel fayl yuboring.")
         await state.set_state(BotStates.Fuel)
@@ -946,23 +1005,24 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
     assigned_entry_idx = set()
     unmatched_by_date = {}
 
-    # Umumiy card total (yakuniy topilmaganlar uchun)
-    card_totals_all = {}
+    driver_totals_all = {}
     for item in fuel_entries:
-        card = str(item.get("card", "")).strip()
-        if not card:
+        driver_id = str(item.get("driver_id", "")).strip()
+        if not driver_id:
             continue
         fuel_sum = float(item.get("fuel", 0.0) or 0.0)
         discount_sum = float(item.get("discount", 0.0) or 0.0)
-        if card not in card_totals_all:
-            card_totals_all[card] = [0.0, 0.0]
-        card_totals_all[card][0] += fuel_sum
-        card_totals_all[card][1] += discount_sum
+        if driver_id not in driver_totals_all:
+            driver_totals_all[driver_id] = [0.0, 0.0]
+        driver_totals_all[driver_id][0] += fuel_sum
+        driver_totals_all[driver_id][1] += discount_sum
 
     for sheet_name in sheet_names:
         ws = sheet_service.get_expenses_board(sheet_name, company)
         if not ws:
             continue
+
+        driver_id_col = fuel_driver_id_lookup_col(sheet_name)
 
         top_grid = ws.get("A1:Z10")
         seg_re = re.compile(r"(\d{1,2}\.\d{1,2})\s*-\s*(\d{1,2}\.\d{1,2})")
@@ -1000,8 +1060,6 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
                 txt = str(cell).strip().lower()
                 if not txt:
                     continue
-                if ("card" in txt and "efs" in txt) or txt == "card #":
-                    card_cols.append(c + 1)
                 if "fuel" in txt and ("exp" in txt or "after" in txt or "amount" in txt):
                     fuel_cols.append(c + 1)
                 if "fuel" not in txt and ("discount" in txt or "disc" in txt):
@@ -1010,8 +1068,6 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
             fuel_cols = [5]
         if not discount_cols:
             discount_cols = [6]
-        if not card_cols:
-            card_cols = [3, 4]
 
         segments = []
         if date_matches:
@@ -1020,46 +1076,37 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
                 end_col = (date_matches[i + 1][2] - 1) if i + 1 < len(date_matches) else 26
                 f_col = next((fc for fc in fuel_cols if start_col <= fc <= end_col), fuel_cols[0])
                 d_col = next((dc for dc in discount_cols if start_col <= dc <= end_col), discount_cols[0])
-                c_col = next((cc for cc in card_cols if start_col <= cc <= end_col), card_cols[0])
                 segments.append(
                     {
                         "label": f"{s_date.strftime('%m.%d')}-{e_date.strftime('%m.%d')}",
                         "start_date": s_date,
                         "end_date": e_date,
-                        "card_col": c_col,
                         "fuel_col": f_col,
                         "discount_col": d_col,
                     }
                 )
         else:
-            # Sana blok topilmasa noto'g'ri haftaga yozmaslik uchun skip qilamiz.
             continue
 
-        seg_card_sets = {}
-        sheet_card_set = set()
-        unique_card_cols = sorted({int(seg["card_col"]) for seg in segments})
-        for cc in unique_card_cols:
-            try:
-                raw_cards = ws.col_values(cc)
-            except Exception:
-                raw_cards = []
-            cset = set()
-            for v in raw_cards[3:]:
-                nv = sheet_service._normalize_load_num(v)
-                if nv:
-                    cset.add(nv)
-            seg_card_sets[cc] = cset
-            sheet_card_set.update(cset)
+        try:
+            raw_driver_ids = ws.col_values(driver_id_col)
+        except Exception:
+            raw_driver_ids = []
+        sheet_driver_set = set()
+        for v in raw_driver_ids[3:]:
+            nid = sheet_service.normalize_driver_id(v)
+            if nid:
+                sheet_driver_set.add(nid)
 
-        card_totals_by_seg = {i: {} for i in range(len(segments))}
+        driver_totals_by_seg = {i: {} for i in range(len(segments))}
         for idx, item in enumerate(fuel_entries):
             if idx in assigned_entry_idx:
                 continue
-            card = str(item.get("card", "")).strip()
-            if not card:
+            driver_id = str(item.get("driver_id", "")).strip()
+            if not driver_id:
                 continue
-            ncard = sheet_service._normalize_load_num(card)
-            if not ncard or ncard not in sheet_card_set:
+            ndid = normalize_driver_id_str(driver_id)
+            if not ndid or ndid not in sheet_driver_set:
                 continue
             try:
                 item_date = datetime.fromisoformat(item["date"]).date()
@@ -1071,73 +1118,70 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
             for i, seg in enumerate(segments):
                 if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
                     continue
-                seg_cards = seg_card_sets.get(int(seg["card_col"]), set())
-                if ncard not in seg_cards:
-                    continue
-                if card not in card_totals_by_seg[i]:
-                    card_totals_by_seg[i][card] = [0.0, 0.0]
-                card_totals_by_seg[i][card][0] += fuel_sum
-                card_totals_by_seg[i][card][1] += discount_sum
+                if driver_id not in driver_totals_by_seg[i]:
+                    driver_totals_by_seg[i][driver_id] = [0.0, 0.0]
+                driver_totals_by_seg[i][driver_id][0] += fuel_sum
+                driver_totals_by_seg[i][driver_id][1] += discount_sum
                 assigned_entry_idx.add(idx)
                 placed = True
                 break
             if not placed:
-                if card not in unmatched_by_date:
-                    unmatched_by_date[card] = [0.0, 0.0]
-                unmatched_by_date[card][0] += fuel_sum
-                unmatched_by_date[card][1] += discount_sum
+                if driver_id not in unmatched_by_date:
+                    unmatched_by_date[driver_id] = [0.0, 0.0]
+                unmatched_by_date[driver_id][0] += fuel_sum
+                unmatched_by_date[driver_id][1] += discount_sum
                 assigned_entry_idx.add(idx)
 
         for i, seg in enumerate(segments):
-            totals = card_totals_by_seg.get(i) or {}
+            totals = driver_totals_by_seg.get(i) or {}
             if not totals:
                 continue
             totals_tuple = {k: (v[0], v[1]) for k, v in totals.items()}
-            _, _, _, missing_cards = sheet_service.update_fuel_toll_expenses(
+            _, _, _, missing_ids = sheet_service.update_fuel_toll_expenses(
                 sheet_name,
                 totals_tuple,
                 fuel_col=seg["fuel_col"],
                 discount_col=seg["discount_col"],
-                card_col=seg["card_col"],
+                card_col=driver_id_col,
+                match_by="driver_id",
                 company=company,
             )
-            missing_set = set(str(x) for x in (missing_cards or []))
-            for card, (fuel_sum, discount_sum) in totals_tuple.items():
-                status = "TOPILMADI" if str(card) in missing_set else "TOPILDI"
+            missing_set = set(str(x) for x in (missing_ids or []))
+            for driver_id, (fuel_sum, discount_sum) in totals_tuple.items():
+                status = "TOPILMADI" if str(driver_id) in missing_set else "TOPILDI"
                 report_rows.append(
                     {
                         "Sheet": sheet_name,
                         "Week": seg["label"],
-                        "Card": str(card),
+                        "Driver ID": str(driver_id),
                         "FuelSum": fuel_sum,
                         "DiscountSum": discount_sum,
                         "Status": status,
-                        "Izoh": "Card topildi" if status == "TOPILDI" else "Bu haftada card topilmadi",
+                        "Izoh": "Driver ID topildi" if status == "TOPILDI" else "Bu haftada Driver ID topilmadi",
                     }
                 )
 
-    # Exceldagi ko'ringan cardlar ichidan reportga tushmaganlari ham albatta ko'rsatiladi.
-    for raw_card in fuel_all_cards:
-        c = str(raw_card).strip()
-        if not c:
+    for raw_id in fuel_all_driver_ids:
+        did = str(raw_id).strip()
+        if not did:
             continue
-        if c not in card_totals_all:
-            card_totals_all[c] = [0.0, 0.0]
+        if did not in driver_totals_all:
+            driver_totals_all[did] = [0.0, 0.0]
 
-    reported_cards = set()
+    reported_ids = set()
     for row in report_rows:
-        cval = row.get("Card")
-        if cval is not None and str(cval).strip():
-            reported_cards.add(str(cval).strip())
+        dval = row.get("Driver ID")
+        if dval is not None and str(dval).strip():
+            reported_ids.add(str(dval).strip())
 
-    for card, (fuel_sum, discount_sum) in unmatched_by_date.items():
-        if str(card).strip() in reported_cards:
+    for driver_id, (fuel_sum, discount_sum) in unmatched_by_date.items():
+        if str(driver_id).strip() in reported_ids:
             continue
         report_rows.append(
             {
                 "Sheet": "(topilmadi)",
                 "Week": "-",
-                "Card": str(card),
+                "Driver ID": str(driver_id),
                 "FuelSum": fuel_sum,
                 "DiscountSum": discount_sum,
                 "Status": "TOPILMADI",
@@ -1145,18 +1189,18 @@ async def callback_fuel_scope(callback: types.CallbackQuery, state: FSMContext):
             }
         )
 
-    for card, (fuel_sum, discount_sum) in card_totals_all.items():
-        if str(card).strip() in reported_cards:
+    for driver_id, (fuel_sum, discount_sum) in driver_totals_all.items():
+        if str(driver_id).strip() in reported_ids:
             continue
         report_rows.append(
             {
                 "Sheet": "(topilmadi)",
                 "Week": "-",
-                "Card": str(card),
+                "Driver ID": str(driver_id),
                 "FuelSum": fuel_sum,
                 "DiscountSum": discount_sum,
                 "Status": "TOPILMADI",
-                "Izoh": "Tanlangan listlar ichida ham card topilmadi",
+                "Izoh": "Tanlangan listlar ichida ham Driver ID topilmadi",
             }
         )
 
@@ -1570,11 +1614,10 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         unique[key] = True
     date_matches = sorted(list(unique.keys()), key=lambda x: x[2])
 
-    # Card/Fuel/Discount ustun topish (Disc Amt -> Discount, Toll Exp emas)
-    card_cols = []
+    # Fuel/Discount ustun topish (Disc Amt -> Discount, Toll Exp emas)
     fuel_cols = []
     discount_cols = []
-    # Taxmin: Fuel/Discount header row 1-6 atrofida
+    driver_id_col = fuel_driver_id_lookup_col(sheet_name)
     for r in range(min(6, len(top_grid))):
         for c in range(min(26, len(top_grid[r]))):
             cell = top_grid[r][c]
@@ -1582,67 +1625,45 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
                 continue
             cell_s = str(cell).lower()
 
-            # "Fuel after discount", "Fuel Exp", "Fuel Expenses" kabi
             if "fuel" in cell_s and ("exp" in cell_s or "after" in cell_s):
                 fuel_cols.append(c + 1)
 
-            # "EFS Card" ustuni (Owner Operators: C, Company Drivers: D)
-            if "efs" in cell_s and "card" in cell_s:
-                card_cols.append(c + 1)
-
-            # "Discount", "Disc Amt" - Disc Amt (Q) shu ustunga yoziladi
-            # "Fuel after discount" ni hisobga olmaslik: fuel bo'lmagan discount
             if "fuel" not in cell_s and ("discount" in cell_s or "disc" in cell_s):
                 discount_cols.append(c + 1)
 
-    # Agar topilmasa, fallback: E=Fuel, F=Discount
     if not fuel_cols:
         fuel_cols = [5]
     if not discount_cols:
         discount_cols = [6]
-    if not card_cols:
-        # Eski layout fallback: C ustun
-        card_cols = [3]
 
-    # Har bir sana oralig'i uchun fuel/discount colni segmentga moslab tanlaymiz.
-    # Segment: date_matches[i].start_col -> date_matches[i+1].start_col-1
     segments = []
     if date_matches:
         for i in range(len(date_matches)):
             start_date, end_date, start_col = date_matches[i]
             end_col = (date_matches[i + 1][2] - 1) if i + 1 < len(date_matches) else 26
-            # segment ichida joylashgan fuel/discount header col'larini tanlaymiz
             f_col = next((fc for fc in fuel_cols if start_col <= fc <= end_col), None)
             d_col = next((dc for dc in discount_cols if start_col <= dc <= end_col), None)
-            c_col = next((cc for cc in card_cols if start_col <= cc <= end_col), None)
             if f_col is None:
                 f_col = fuel_cols[0]
             if d_col is None:
                 d_col = discount_cols[0]
-            if c_col is None:
-                c_col = card_cols[0]
             segments.append({
                 "label": f"{start_date.strftime('%m.%d')}-{end_date.strftime('%m.%d')}",
                 "start_date": start_date,
                 "end_date": end_date,
-                "card_col": c_col,
                 "fuel_col": f_col,
                 "discount_col": d_col,
             })
     else:
-        # sana topilmasa - bitta umumiy segment
         segments = [{
             "label": sheet_name,
             "start_date": date(year, 1, 1),
             "end_date": date(year, 12, 31),
-            "card_col": card_cols[0],
             "fuel_col": fuel_cols[0],
             "discount_col": discount_cols[0],
         }]
 
-    # Auto-mapping: foydalanuvchi sana oralig'ini tanlamaydi,
-    # xlsxdagi har bir sana o'z segmentiga tushib, shu haftaga yoziladi.
-    card_totals_by_seg = {i: {} for i in range(len(segments))}
+    driver_totals_by_seg = {i: {} for i in range(len(segments))}
     matched_items = 0
 
     for item in fuel_entries:
@@ -1651,8 +1672,8 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         except Exception:
             continue
 
-        card = str(item.get("card", "")).strip()
-        if not card:
+        driver_id = str(item.get("driver_id", "")).strip()
+        if not driver_id:
             continue
 
         fuel_sum = float(item.get("fuel", 0.0) or 0.0)
@@ -1663,10 +1684,10 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
             if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
                 continue
 
-            if card not in card_totals_by_seg[i]:
-                card_totals_by_seg[i][card] = [0.0, 0.0]
-            card_totals_by_seg[i][card][0] += fuel_sum
-            card_totals_by_seg[i][card][1] += discount_sum
+            if driver_id not in driver_totals_by_seg[i]:
+                driver_totals_by_seg[i][driver_id] = [0.0, 0.0]
+            driver_totals_by_seg[i][driver_id][0] += fuel_sum
+            driver_totals_by_seg[i][driver_id][1] += discount_sum
             assigned = True
             break
 
@@ -1675,25 +1696,26 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
 
     total_updated = 0
     total_skipped = 0
-    missing_cards_by_seg = {}
+    missing_ids_by_seg = {}
 
     for i, seg in enumerate(segments):
-        card_totals = card_totals_by_seg.get(i) or {}
-        if not card_totals:
+        driver_totals = driver_totals_by_seg.get(i) or {}
+        if not driver_totals:
             continue
 
-        card_totals_tuple = {k: (v[0], v[1]) for k, v in card_totals.items()}
-        updated, skipped, missing_count, missing_cards = sheet_service.update_fuel_toll_expenses(
+        driver_totals_tuple = {k: (v[0], v[1]) for k, v in driver_totals.items()}
+        updated, skipped, missing_count, missing_ids = sheet_service.update_fuel_toll_expenses(
             sheet_name,
-            card_totals_tuple,
+            driver_totals_tuple,
             fuel_col=seg["fuel_col"],
             discount_col=seg["discount_col"],
-            card_col=seg.get("card_col", 3),
+            card_col=driver_id_col,
+            match_by="driver_id",
             company=company,
         )
         total_updated += updated
         total_skipped += skipped
-        missing_cards_by_seg[i] = set(str(x) for x in (missing_cards or []))
+        missing_ids_by_seg[i] = set(str(x) for x in (missing_ids or []))
 
     if matched_items == 0:
         await callback.message.edit_text(
@@ -1703,22 +1725,21 @@ async def callback_fuel_sheet(callback: types.CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.Fuel)
         return
 
-    # Excel report (TOPILDI/TOPILMADI va qaysi hafta)
     report_rows = []
     for i, seg in enumerate(segments):
-        seg_cards = card_totals_by_seg.get(i) or {}
-        if not seg_cards:
+        seg_drivers = driver_totals_by_seg.get(i) or {}
+        if not seg_drivers:
             continue
-        seg_missing = missing_cards_by_seg.get(i) or set()
-        for card, (fuel_sum, discount_sum) in seg_cards.items():
-            card_s = str(card)
+        seg_missing = missing_ids_by_seg.get(i) or set()
+        for driver_id, (fuel_sum, discount_sum) in seg_drivers.items():
+            did_s = str(driver_id)
             if (fuel_sum or 0) == 0 and (discount_sum or 0) == 0:
                 continue
-            status = "TOPILMADI" if card_s in seg_missing else "TOPILDI"
+            status = "TOPILMADI" if did_s in seg_missing else "TOPILDI"
             report_rows.append({
                 "Sheet": sheet_name,
                 "Week": seg.get("label"),
-                "Card": card_s,
+                "Driver ID": did_s,
                 "FuelSum": fuel_sum,
                 "DiscountSum": discount_sum,
                 "Status": status,
@@ -1810,8 +1831,8 @@ async def callback_fuel_range(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("⏳ Kutib turing, natija tez orada chiqadi...")
 
-    # Filter faqat shu oralig'idagi yozuvlar (sheet yili bilan oy-kun moslashtiriladi).
-    card_totals = {}
+    driver_id_col = fuel_driver_id_lookup_col(sheet_name)
+    driver_totals = {}
 
     for item in fuel_entries:
         try:
@@ -1820,17 +1841,17 @@ async def callback_fuel_range(callback: types.CallbackQuery, state: FSMContext):
             continue
         if not expense_item_date_in_segment(item_date, seg["start_date"], seg["end_date"]):
             continue
-        card = str(item.get("card", "")).strip()
-        if not card:
+        driver_id = str(item.get("driver_id", "")).strip()
+        if not driver_id:
             continue
         fuel_sum = float(item.get("fuel", 0.0) or 0.0)
         discount_sum = float(item.get("discount", 0.0) or 0.0)
-        if card not in card_totals:
-            card_totals[card] = [0.0, 0.0]
-        card_totals[card][0] += fuel_sum
-        card_totals[card][1] += discount_sum
+        if driver_id not in driver_totals:
+            driver_totals[driver_id] = [0.0, 0.0]
+        driver_totals[driver_id][0] += fuel_sum
+        driver_totals[driver_id][1] += discount_sum
 
-    if not card_totals:
+    if not driver_totals:
         await callback.message.edit_text(f"List <b>{sheet_name}</b> oralig'ida mos yozuv topilmadi.")
         await state.set_state(BotStates.Fuel)
         return
@@ -1838,27 +1859,29 @@ async def callback_fuel_range(callback: types.CallbackQuery, state: FSMContext):
     from services.google_sheets import get_sheet_service
     sheet_service = get_sheet_service()
 
-    card_totals_tuple = {k: (v[0], v[1]) for k, v in card_totals.items()}
-    updated, skipped, missing_count, missing_cards = sheet_service.update_fuel_toll_expenses(
+    driver_totals_tuple = {k: (v[0], v[1]) for k, v in driver_totals.items()}
+    updated, skipped, missing_count, missing_ids = sheet_service.update_fuel_toll_expenses(
         sheet_name,
-        card_totals_tuple,
+        driver_totals_tuple,
         fuel_col=seg["fuel_col"],
         discount_col=seg["discount_col"],
+        card_col=driver_id_col,
+        match_by="driver_id",
         company=company,
     )
 
     report_rows = []
-    missing_set = set(str(x) for x in (missing_cards or []))
+    missing_set = set(str(x) for x in (missing_ids or []))
     week_label = seg.get("label")
-    for card, (fuel_sum, discount_sum) in card_totals_tuple.items():  # fuel_range
-        card_s = str(card)
+    for driver_id, (fuel_sum, discount_sum) in driver_totals_tuple.items():
+        did_s = str(driver_id)
         if (fuel_sum or 0) == 0 and (discount_sum or 0) == 0:
             continue
-        status = "TOPILMADI" if card_s in missing_set else "TOPILDI"
+        status = "TOPILMADI" if did_s in missing_set else "TOPILDI"
         report_rows.append({
             "Sheet": sheet_name,
             "Week": week_label,
-            "Card": card_s,
+            "Driver ID": did_s,
             "FuelSum": fuel_sum,
             "DiscountSum": discount_sum,
             "Status": status,

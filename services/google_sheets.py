@@ -952,6 +952,23 @@ class GoogleSheetService:
         sheet.append_row(data)
         return True
 
+    @staticmethod
+    def normalize_driver_id(val):
+        """Driver ID taqqoslash (091730 va 91730 bir xil)."""
+        if val is None:
+            return ""
+        if isinstance(val, float) and val != val:
+            return ""
+        s = str(val).replace("\xa0", " ").strip()
+        if not s or s.lower() in ("nan", "driver id", "driverid"):
+            return ""
+        if s.endswith(".0"):
+            s = s[:-2]
+        s = re.sub(r"\s+", "", s)
+        if s.isdigit():
+            return s.lstrip("0") or "0"
+        return s.upper()
+
     def find_card_row_in_expenses(self, card_number, sheet_name, card_col=3, start_row=4, company=None):
         """
         Expenses sheetida (ikkinchi spreadsheet), C4 kabi ko'rinishdagi card-larni topadi.
@@ -971,56 +988,66 @@ class GoogleSheetService:
             print(f"find_card_row_in_expenses error: {e}")
             return None
 
-    def update_fuel_toll_expenses(self, sheet_name, card_totals, fuel_col=5, discount_col=6, card_col=3, start_row=4, company=None):
+    def update_fuel_toll_expenses(
+        self,
+        sheet_name,
+        card_totals,
+        fuel_col=5,
+        discount_col=6,
+        card_col=3,
+        start_row=4,
+        company=None,
+        match_by="card",
+    ):
         """
-        card_totals: {card: (fuel_sum, discount_sum)}
-        C (card) ustunidan qator raqamini topib:
-          - fuel_col (masalan E) ga fuel_sum yozadi
-          - discount_col (masalan F) ga discount_sum yozadi (Disc Amt, Toll Exp emas)
-
-        Optimallashtirish: card/fuel/discount ustunlarini 1 marta o'qib, keyin local map bilan ishlaydi.
+        card_totals: {lookup_key: (fuel_sum, discount_sum)}
+        card_col: qidiruv ustuni (EFS Card yoki DRIVER ID).
+        match_by: 'card' | 'driver_id'
         """
         sheet = self.get_expenses_board(sheet_name, company)
         if not sheet:
             return (0, 0, 0, [])
 
-        # 1 marta o'qish (API sonini keskin kamaytiradi)
-        cards = sheet.col_values(card_col)
+        normalize_key = (
+            self.normalize_driver_id
+            if str(match_by or "").lower() == "driver_id"
+            else self._normalize_load_num
+        )
+
+        lookup_vals = sheet.col_values(card_col)
         fuel_vals = sheet.col_values(fuel_col)
         discount_vals = sheet.col_values(discount_col)
 
-        # card_normalized -> row_num
-        card_to_row = {}
-        for i in range(start_row - 1, len(cards)):
-            raw = cards[i]
-            norm = self._normalize_load_num(raw)
+        key_to_row = {}
+        for i in range(start_row - 1, len(lookup_vals)):
+            raw = lookup_vals[i]
+            norm = normalize_key(raw)
             if not norm:
                 continue
-            if norm not in card_to_row:
-                card_to_row[norm] = i + 1  # gspread 1-indexed qator
+            if norm not in key_to_row:
+                key_to_row[norm] = i + 1
 
         updated = 0
         skipped = 0
-        missing_cards = []
+        missing_keys = []
         cells = []
 
-        for card, totals in card_totals.items():
+        for lookup_key, totals in card_totals.items():
             if not totals:
                 continue
             fuel_sum, discount_sum = totals
-            target = self._normalize_load_num(card)
+            target = normalize_key(lookup_key)
             if not target:
                 continue
 
-            row = card_to_row.get(target)
+            row = key_to_row.get(target)
             if not row:
-                missing_cards.append(card)
+                missing_keys.append(lookup_key)
                 continue
 
             fuel_cur = fuel_vals[row - 1] if row - 1 < len(fuel_vals) else ""
             discount_cur = discount_vals[row - 1] if row - 1 < len(discount_vals) else ""
 
-            # Faqat bo'sh/0 bo'lsa yozamiz
             if self._is_empty_or_zero(fuel_cur):
                 cells.append(Cell(row=row, col=fuel_col, value=fuel_sum))
                 updated += 1
@@ -1034,7 +1061,7 @@ class GoogleSheetService:
 
         if cells:
             sheet.update_cells(cells)
-        return (updated, skipped, len(missing_cards), missing_cards)
+        return (updated, skipped, len(missing_keys), missing_keys)
 
     def update_toll_expenses(self, sheet_name, transponder_totals, toll_col, transponder_col=4, start_row=4, company=None):
         """
