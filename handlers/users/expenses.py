@@ -33,6 +33,9 @@ def _flatten_column_name(col) -> str:
 def match_fuel_four_columns(headers: list[str]) -> tuple[int, int, int, int] | None:
     """
     Normalizatsiyalangan sarlavha ro'yxatidan ustun indekslari: card, date, disc, amt.
+
+    EFS/Delo eksportlari ham qo'llab-quvvatlanadi, masalan:
+    Card Number, Transaction Date, Transaction Discount, Amount, Driver ID.
     """
     n = len(headers)
     if n < 4:
@@ -49,13 +52,14 @@ def match_fuel_four_columns(headers: list[str]) -> tuple[int, int, int, int] | N
             elif h in ("transaction date", "post date") and "toll" not in h:
                 date_col = j
         if disc_col is None:
-            if (
-                "disc" in h
-                and "amt" in h
-                and "ppu" not in h
-                and "cost" not in h
-                and "type" not in h
-            ):
+            # Disc Amt | Transaction Discount | Discount | Disc Amount
+            if "ppu" in h or "cost" in h or "type" in h:
+                pass
+            elif ("disc" in h and "amt" in h) or ("discount" in h and "amount" in h):
+                disc_col = j
+            elif h in ("transaction discount", "discount", "disc amount", "discount amount"):
+                disc_col = j
+            elif "discount" in h and "fee" not in h:
                 disc_col = j
         if amt_col is None:
             if h == "amt" or (h == "amount" and "disc" not in h):
@@ -76,6 +80,13 @@ def match_fuel_four_columns(headers: list[str]) -> tuple[int, int, int, int] | N
         for j, h in enumerate(headers):
             if h in ("net amt", "fuel amt", "total amt", "total") and "disc" not in h:
                 amt_col = j
+                break
+    if disc_col is None:
+        for j, h in enumerate(headers):
+            if not h or "ppu" in h or "type" in h or "cost" in h or "fee" in h:
+                continue
+            if "disc" in h or "discount" in h:
+                disc_col = j
                 break
     if (
         card_col is not None
@@ -536,9 +547,10 @@ async def enter_fuel(message: types.Message, state: FSMContext):
         return
     await state.set_state(BotStates.Fuel)
     await message.answer(
-        "Excel (xlsx, xls) yuboring. Jadvalda <b>Card #</b>, <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> "
-        "va <b>Driver ID</b> (M ustun) bo'lsa — bot Driver ID orqali Owner Operators (C) / Company Drivers (D) "
-        "sheetlarida qator topib yozadi.",
+        "Excel (xlsx, xls) yuboring. Jadvalda <b>Card #</b>/<b>Card Number</b>, "
+        "<b>Tran Date</b>/<b>Transaction Date</b>, <b>Disc Amt</b>/<b>Transaction Discount</b>, "
+        "<b>Amt</b>/<b>Amount</b> va <b>Driver ID</b> (odatda M ustun) bo'lsa — bot Driver ID orqali "
+        "Owner Operators (C) / Company Drivers (D) sheetlarida qator topib yozadi.",
         reply_markup=expenses_menu,
     )
 
@@ -779,7 +791,9 @@ async def handle_expense_doc(message: types.Message, expense_type: str, state: F
                 else:
                     hint = (
                         "Kerakli ustunlar topilmadi yoki yozuvlar o'qilmadi (sana/driver id). "
-                        "Faylda <b>Driver ID</b> (M ustun), <b>Tran Date</b>, <b>Disc Amt</b>, <b>Amt</b> bo'lsin; "
+                        "Faylda <b>Driver ID</b>, <b>Tran Date</b>/<b>Transaction Date</b>, "
+                        "<b>Disc Amt</b>/<b>Transaction Discount</b>, <b>Amt</b>/<b>Amount</b> "
+                        "va <b>Card #</b>/<b>Card Number</b> bo'lsin; "
                         "faylni Excelda <b>.xlsx</b> qilib qayta saqlang (CSV emas)."
                     )
                 try:
